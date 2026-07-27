@@ -269,6 +269,8 @@ group.add_argument('--no-aug', action='store_true', default=False,
                    help='Disable all training augmentation, override other train aug args')
 group.add_argument('--train-crop-mode', type=str, default=None,
                    help='Crop-mode in train'),
+group.add_argument('--crop-mode', type=str, default=None,
+                   help="Inference/validation crop mode, one of ('squash', 'border', 'center')"),
 group.add_argument('--scale', type=float, nargs='+', default=[0.08, 1.0], metavar='PCT',
                    help='Random resize scale (default: 0.08 1.0)')
 group.add_argument('--ratio', type=float, nargs='+', default=[3. / 4., 4. / 3.], metavar='RATIO',
@@ -862,6 +864,7 @@ def main():
             interpolation=data_config['interpolation'],
             num_workers=eval_workers,
             crop_pct=data_config['crop_pct'],
+            crop_mode=args.crop_mode,
         )
 
         if args.naflex_loader:

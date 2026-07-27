@@ -95,7 +95,7 @@ def transforms_imagenet_train(
 
     Args:
         img_size: Target image size.
-        train_crop_mode: Training random crop mode ('rrc', 'rkrc', 'rkrr').
+        train_crop_mode: Training random crop mode ('rrc', 'rkrc', 'rkrr', 'squash').
         scale: Random resize scale range (crop area, < 1.0 => zoom in).
         ratio: Random aspect ratio range (crop ratio for RRC, ratio adjustment factor for RKR).
         hflip: Horizontal flip probability.
@@ -129,7 +129,7 @@ def transforms_imagenet_train(
             * normalizes and converts the branches above with the third, final transform
     """
     train_crop_mode = train_crop_mode or 'rrc'
-    assert train_crop_mode in {'rrc', 'rkrc', 'rkrr'}
+    assert train_crop_mode in {'rrc', 'rkrc', 'rkrr', 'squash'}
 
     primary_tfl = []
     if naflex:
@@ -143,7 +143,24 @@ def transforms_imagenet_train(
             interpolation=interpolation
         )]
     else:
-        if train_crop_mode in ('rkrc', 'rkrr'):
+        if train_crop_mode == 'squash':
+            # squash: first resize the whole image to a square (preserves all content for extreme
+            # aspect ratios), then apply the standard RandomResizedCrop on that square for
+            # scale/ratio augmentation.
+            img_sz = img_size if isinstance(img_size, (tuple, list)) else (img_size, img_size)
+            squash_interp = 'bicubic' if interpolation == 'random' else interpolation
+            scale = tuple(scale or (0.08, 1.0))
+            ratio = tuple(ratio or (3. / 4., 4. / 3.))
+            primary_tfl += [
+                transforms.Resize(img_sz, interpolation=str_to_interp_mode(squash_interp)),
+                RandomResizedCropAndInterpolation(
+                    img_size,
+                    scale=scale,
+                    ratio=ratio,
+                    interpolation=interpolation,
+                ),
+            ]
+        elif train_crop_mode in ('rkrc', 'rkrr'):
             # FIXME integration of RKR is a WIP
             scale = tuple(scale or (0.8, 1.00))
             ratio = tuple(ratio or (0.9, 1/.9))
@@ -416,7 +433,7 @@ def create_transform(
         input_size: Target input size (channels, height, width) tuple or size scalar.
         is_training: Return training (random) transforms.
         no_aug: Disable augmentation for training (useful for debug).
-        train_crop_mode: Training random crop mode ('rrc', 'rkrc', 'rkrr').
+        train_crop_mode: Training random crop mode ('rrc', 'rkrc', 'rkrr', 'squash').
         scale: Random resize scale range (crop area, < 1.0 => zoom in).
         ratio: Random aspect ratio range (crop ratio for RRC, ratio adjustment factor for RKR).
         hflip: Horizontal flip probability.
