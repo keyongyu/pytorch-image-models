@@ -856,6 +856,15 @@ def _gen_efficientnet_lite(variant, channel_multiplier=1.0, depth_multiplier=1.0
         ['ir_r4_k5_s2_e6_c192'],
         ['ir_r1_k3_s1_e6_c320'],
     ]
+    arch_def = [
+        ['ds_r1_k3_s1_e1_c16'],
+        ['ir_r2_k3_s2_e6_c24'],
+        ['ir_r2_k3_s2_e6_c40'],
+        ['ir_r3_k3_s2_e6_c60'],
+        ['ir_r3_k3_s1_e6_c80'],
+        ['ir_r4_k3_s2_e6_c120'],
+        ['ir_r1_k3_s1_e6_c160'],
+    ]
     model_kwargs = dict(
         block_args=decode_arch_def(arch_def, depth_multiplier, fix_first_last=True),
         num_features=1280,

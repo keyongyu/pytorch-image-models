@@ -11,6 +11,14 @@ __pycache__/
 build/
 develop-eggs/
 dist/
+pepsi_test/
+pepsi_4types/
+pepsi_merge/
+pepsi4output/
+pepsioutput/
+posmlv/
+stanford_cars/
+stanford_cars_output/
 downloads/
 eggs/
 .eggs/

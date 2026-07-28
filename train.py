@@ -16,6 +16,7 @@ Hacked together by / Copyright 2020 Ross Wightman (https://github.com/rwightman)
 """
 import argparse
 import copy
+import glob
 import importlib
 import json
 import logging
@@ -267,6 +268,13 @@ group.add_argument('--decay-rate', '--dr', type=float, default=0.1, metavar='RAT
 group = parser.add_argument_group('Augmentation and regularization parameters')
 group.add_argument('--no-aug', action='store_true', default=False,
                    help='Disable all training augmentation, override other train aug args')
+group.add_argument('--nobg', action='store_true', default=False,
+                   help='Route nobg_*.png (background-removed) samples to the npaug bg-swap '
+                        'transforms; other samples use the standard transform. Forces native '
+                        'input image mode so alpha/filename survive.')
+group.add_argument('--heavy-aug', action='store_true', default=False,
+                   help='Use the heavy albumentations augmentation pipeline (npaug) for all '
+                        'training images (strong lighting/shadow/blur/weather/geometric aug).')
 group.add_argument('--train-crop-mode', type=str, default=None,
                    help='Crop-mode in train'),
 group.add_argument('--crop-mode', type=str, default=None,
@@ -390,6 +398,8 @@ group.add_argument('--experiment', default='', type=str, metavar='NAME',
                    help='name of train experiment, name of sub-folder for output')
 group.add_argument('--eval-metric', default='top1', type=str, metavar='EVAL_METRIC',
                    help='Best metric (default: "top1"')
+group.add_argument('--per-class-acc', action='store_true', default=False,
+                   help='Log per-class top-1 accuracy during validation (default: off)')
 group.add_argument('--tta', type=int, default=0, metavar='N',
                    help='Test/inference time augmentation (oversampling) factor. 0=None (default: 0)')
 group.add_argument('--use-multi-epochs-loader', action='store_true', default=False,
@@ -489,6 +499,25 @@ def _set_loader_epoch(loader, epoch: int) -> None:
 def main():
     utils.setup_default_logging()
     args, args_text = _parse_args()
+
+    if args.nobg:
+        # bg-swap needs a background-image folder; without it the transform silently falls back
+        # to a plain fill, so fail early instead of training on wrong data.
+        bg_dir = os.environ.get('NOBG_BG_DIR')
+        if not bg_dir or not os.path.isdir(bg_dir):
+            raise RuntimeError(
+                '--nobg is set but NOBG_BG_DIR is not set to an existing directory. '
+                'Point it at a folder of background images, e.g. '
+                'export NOBG_BG_DIR=/path/to/bg_photos'
+            )
+        bg_imgs = []
+        for ext in ('*.jpg', '*.jpeg', '*.png'):
+            bg_imgs += glob.glob(os.path.join(bg_dir, '**', ext), recursive=True)
+        if not bg_imgs:
+            raise RuntimeError(
+                f'--nobg is set but no background images (jpg/jpeg/png) were found under '
+                f'NOBG_BG_DIR={bg_dir}'
+            )
 
     if args.device_modules:
         for module in args.device_modules:
@@ -643,10 +672,13 @@ def main():
     # create the train and eval datasets
     if args.data and not args.data_dir:
         args.data_dir = args.data
-    if args.input_img_mode is None:
-        input_img_mode = 'RGB' if data_config['input_size'][0] == 3 else 'L'
-    else:
+    if args.input_img_mode is not None:
         input_img_mode = args.input_img_mode
+    elif args.nobg:
+        # preserve native mode (RGBA) + filename so the nobg dispatcher can detect cutouts
+        input_img_mode = None
+    else:
+        input_img_mode = 'RGB' if data_config['input_size'][0] == 3 else 'L'
 
     dataset_train = create_dataset(
         args.dataset,
@@ -818,6 +850,8 @@ def main():
             num_batches=args.train_batches_per_epoch,
             collate_fn=collate_fn,
             use_multi_epochs_loader=args.use_multi_epochs_loader,
+            nobg=args.nobg,
+            heavy_aug=args.heavy_aug,
             **common_loader_kwargs,
             **train_loader_kwargs,
         )
@@ -882,6 +916,7 @@ def main():
             loader_eval = create_loader(
                 dataset_eval,
                 input_size=data_config['input_size'],
+                nobg=args.nobg,
                 **common_loader_kwargs,
                 **eval_loader_kwargs,
             )
@@ -1471,6 +1506,12 @@ def validate(
     top1_m = utils.AverageMeter()
     top5_m = utils.AverageMeter()
 
+    # per-class top-1 accuracy tracking, only when --per-class-acc is set
+    # (counts local per-rank; summed across ranks below)
+    num_classes = (args.num_classes or 0) if getattr(args, 'per_class_acc', False) else 0
+    class_correct = torch.zeros(num_classes, device=device) if num_classes else None
+    class_total = torch.zeros(num_classes, device=device) if num_classes else None
+
     model.eval()
 
     end = time.time()
@@ -1497,6 +1538,12 @@ def validate(
 
                 loss = loss_fn(output, target)
             acc1, acc5 = utils.accuracy(output, target, topk=(1, 5))
+
+            if num_classes:
+                pred = output.argmax(dim=1)
+                correct = (pred == target).to(class_correct.dtype)
+                class_total.scatter_add_(0, target, torch.ones_like(target, dtype=class_total.dtype))
+                class_correct.scatter_add_(0, target, correct)
 
             if args.distributed:
                 reduced_loss = utils.reduce_tensor(loss.data, args.world_size)
@@ -1526,6 +1573,26 @@ def validate(
                     f'Acc@1: {top1_m.val:>7.3f} ({top1_m.avg:>7.3f})  '
                     f'Acc@5: {top5_m.val:>7.3f} ({top5_m.avg:>7.3f})'
                 )
+
+    if num_classes and utils.is_primary(args):
+        if args.distributed:
+            torch.distributed.all_reduce(class_correct, op=torch.distributed.ReduceOp.SUM)
+            torch.distributed.all_reduce(class_total, op=torch.distributed.ReduceOp.SUM)
+        # map class index -> name if the dataset exposes it
+        idx_to_class = None
+        try:
+            c2i = loader.dataset.reader.class_to_idx
+            idx_to_class = {v: k for k, v in c2i.items()}
+        except Exception:
+            idx_to_class = None
+        cc = class_correct.cpu()
+        ct = class_total.cpu()
+        log_name = 'Test' + log_suffix
+        for c in range(num_classes):
+            name = idx_to_class.get(c, str(c)) if idx_to_class else str(c)
+            total_c = int(ct[c].item())
+            acc_c = 100.0 * cc[c].item() / total_c if total_c > 0 else float('nan')
+            _logger.info(f'{log_name} per-class  {name:<16s} acc@1: {acc_c:6.2f}%  (n={total_c})')
 
     metrics = OrderedDict([('loss', losses_m.avg), ('top1', top1_m.avg), ('top5', top5_m.avg)])
 

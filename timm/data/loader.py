@@ -242,6 +242,8 @@ def create_loader(
         persistent_workers: bool = True,
         worker_seeding: str = 'all',
         tf_preprocessing: bool = False,
+        nobg: bool = False,
+        heavy_aug: bool = False,
         input_size_choices: Optional[Sequence[Union[int, Tuple[int, int], Tuple[int, int, int]]]] = None,
         batch_size_choices: Optional[Sequence[int]] = None,
         batch_choice_weights: Optional[Sequence[float]] = None,
@@ -340,6 +342,8 @@ def create_loader(
         tf_preprocessing=tf_preprocessing,
         use_prefetcher=use_prefetcher,
         separate=num_aug_splits > 0,
+        nobg=nobg,
+        heavy_aug=heavy_aug,
     )
     channels = (
         input_size[0]

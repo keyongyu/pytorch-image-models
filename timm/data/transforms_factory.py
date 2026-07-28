@@ -4,6 +4,7 @@ Factory methods for building image transforms for use with TIMM (PyTorch Image M
 Hacked together by / Copyright 2019, Ross Wightman
 """
 import math
+import os
 from typing import Optional, Tuple, Union
 
 import torch
@@ -393,6 +394,37 @@ def transforms_imagenet_eval(
     return transforms.Compose(tfl)
 
 
+class NobgDispatchTransform:
+    """Route each image to a background-removed (nobg) transform or the standard transform.
+
+    A sample is treated as "nobg" when its source filename starts with 'nobg_' and ends with
+    '.png' (background-removed cutout). If the filename isn't available on the PIL image (e.g.
+    the loader already dropped it), it falls back to detecting an RGBA image mode.
+
+    For the filename/mode signal to survive, the dataset should load images in native mode
+    (input_img_mode=None) so nobg PNGs keep their alpha and `.filename` reaches the transform.
+    """
+
+    def __init__(self, standard_transform, nobg_transform):
+        self.standard_transform = standard_transform
+        self.nobg_transform = nobg_transform
+
+    @staticmethod
+    def _is_nobg(img) -> bool:
+        name = os.path.basename(getattr(img, 'filename', '') or '')
+        if name:
+            return name.startswith('nobg_') and name.lower().endswith('.png')
+        return getattr(img, 'mode', '') == 'RGBA'  # fallback when filename unavailable
+
+    def __call__(self, img):
+        if self._is_nobg(img):
+            return self.nobg_transform(img)
+        # standard transforms expect RGB; convert if the loader preserved a non-RGB mode
+        if getattr(img, 'mode', 'RGB') != 'RGB':
+            img = img.convert('RGB')
+        return self.standard_transform(img)
+
+
 def create_transform(
         input_size: Union[int, Tuple[int, int], Tuple[int, int, int]] = 224,
         is_training: bool = False,
@@ -426,6 +458,8 @@ def create_transform(
         max_seq_len: int = 576,  # 24x24 for 16x16 patch
         patchify: bool = False,
         patchify_channels_last: bool = True,
+        nobg: bool = False,
+        heavy_aug: bool = False,
 ):
     """
 
@@ -458,6 +492,10 @@ def create_transform(
         use_prefetcher: Pre-fetcher enabled. Do not convert image to tensor or normalize.
         normalize: Normalization tensor output w/ provided mean/std (if prefetcher not used).
         separate: Output transforms in 3-stage tuple.
+        nobg: Route nobg_*.png (background-removed) samples to the bg-swap transforms from
+            timm.data.npaug, and all other samples to the standard transform. Requires the
+            dataset to load images in native mode (input_img_mode=None) so the alpha channel
+            and filename survive to the transform.
 
     Returns:
         Composed transforms or tuple thereof
@@ -533,5 +571,48 @@ def create_transform(
                 patchify=patchify,
                 patchify_channels_last=patchify_channels_last,
             )
+
+    if heavy_aug and is_training and not no_aug and not tf_preprocessing:
+        # replace the training transform with the heavy albumentations pipeline (applied to all images)
+        assert not separate, "heavy_aug not supported with separate transforms"
+        assert not naflex, "heavy_aug not supported with naflex"
+        from timm.data.npaug import transform_heavy_train
+        transform = transform_heavy_train(
+            img_size,
+            train_crop_mode=train_crop_mode,
+            mean=mean,
+            std=std,
+            interpolation=interpolation,
+            use_prefetcher=use_prefetcher,
+            normalize=normalize,
+        )
+
+    if nobg:
+        # route nobg_*.png (background-removed) samples to the bg-swap transforms, others to standard
+        assert not separate, "nobg dispatch not supported with separate transforms"
+        assert not naflex, "nobg dispatch not supported with naflex"
+        from timm.data.npaug import transform_nobg_train, transform_nobg_eval
+        if is_training and not no_aug:
+            nobg_transform = transform_nobg_train(
+                img_size,
+                train_crop_mode=train_crop_mode,
+                mean=mean,
+                std=std,
+                interpolation=interpolation,
+                use_prefetcher=use_prefetcher,
+                normalize=normalize,
+            )
+        else:
+            nobg_transform = transform_nobg_eval(
+                img_size,
+                crop_pct=crop_pct,
+                crop_mode=crop_mode,
+                interpolation=interpolation,
+                mean=mean,
+                std=std,
+                use_prefetcher=use_prefetcher,
+                normalize=normalize,
+            )
+        transform = NobgDispatchTransform(transform, nobg_transform)
 
     return transform
