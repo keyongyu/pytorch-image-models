@@ -260,6 +260,13 @@ def main():
                 label_names=label_names,
                 label_descriptions=label_descriptions,
             )
+        elif args.class_map:
+            # fall back to the provided --class-map file for output labels (index -> name)
+            from timm.data.readers.class_map import load_class_map
+            class_to_idx = load_class_map(args.class_map)
+            dataset_info = CustomDatasetInfo(
+                label_names={idx: name for name, idx in class_to_idx.items()},
+            )
         else:
             imagenet_subset = infer_imagenet_subset({'num_classes': args.num_classes})
             if imagenet_subset is not None:
