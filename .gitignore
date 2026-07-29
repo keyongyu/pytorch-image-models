@@ -127,3 +127,8 @@ Testing notebook.ipynb
 /*.png
 /*.zip
 /*.tar.*
+
+# nptools export/conversion artifacts and weights (regenerated; do not track)
+nptools/model_openset.*
+nptools/weights/
+.zed/

@@ -40,19 +40,19 @@ dependencies = [
 dynamic = ["version"]
 
 [project.optional-dependencies]
-# Extra libraries used by the experimentation scripts in kytest/ and by timm/data/npaug.py
+# Extra libraries used by the experimentation scripts in nptools/ and by timm/data/npaug.py
 # (data augmentation, background removal, ONNX/NCNN export). NOT needed for core timm — npaug
 # imports albumentations/cv2 lazily. Require Python >= 3.10 (modern rembg/albumentations/
 # onnxruntime drop 3.9), hence the markers.
 #
-# NOTE: a clean `uv lock`/`uv sync --extra kytest` can conflict — rembg pulls CPU `onnxruntime`
+# NOTE: a clean `uv lock`/`uv sync --extra nptools` can conflict — rembg pulls CPU `onnxruntime`
 # while we want `onnxruntime-gpu`, and onnxruntime-gpu additionally needs matching CUDA 12 + cuDNN 9
 # libs (installed separately as nvidia-*-cu12 wheels). The tested install path is direct:
 #   uv pip install "albumentations>=2.0" opencv-python-headless "rembg>=2.0.69" \
 #                  "onnxruntime-gpu>=1.17,<1.20" "onnx>=1.16" ncnn \
 #                  nvidia-cudnn-cu12 nvidia-cublas-cu12 nvidia-cufft-cu12 nvidia-curand-cu12 \
 #                  nvidia-cuda-runtime-cu12 nvidia-cuda-nvrtc-cu12
-kytest = [
+nptools = [
     "albumentations>=2.0 ; python_version >= '3.10'",
     "opencv-python-headless>=4.10 ; python_version >= '3.10'",
     "rembg>=2.0.69 ; python_version >= '3.10'",
