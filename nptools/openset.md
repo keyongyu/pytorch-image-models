@@ -15,7 +15,7 @@ classes, even a brand-new product it has never seen. Open-set recognition adds a
 How it works here (feature-prototype / metric approach):
 
 ```
-      ┌──────────── build once, from training data (classes from class-map) ──────┐
+      ┌──────────── build once, from training data (classes from class-map) ─────┐
       │  for each class: mean of its pre-logits features → prototype (L2-norm)   │
       │  PER-CLASS threshold[c] = 95th percentile of THAT class's own distances  │
       └──────────────────────────────────────────────────────────────────────────┘
@@ -60,7 +60,8 @@ class-map defines which classes to use, in what order, and — via its line coun
 | `--export-onnx [PATH]` | no | export ONNX (+ `<PATH>.meta.json`); default `<checkpoint>_openset.onnx` |
 | `--export-pt [PATH]` | no | export TorchScript (+ `<PATH>.meta.json`); default `<checkpoint>_openset.pt` |
 | `--image PATH` | no | classify a single image (else scans `val/` + `test/`) |
-| `--load-onnx PATH` | no | predict via an already-exported ONNX; class names read from `<PATH>.meta.json` |
+| `--load-onnx PATH` | no | predict via an already-exported ONNX; class names and output format (`no_argmin`) are read from `<PATH>.meta.json` — the CLI `--no-argmin` flag is ignored on this path |
+| `--no-argmin` | no | export the **client-side-argmin** variant: the graph emits per-class `dists`/`margins` vectors (no `argmin`/`gather` in the model) and the argmin + reject move to the client. Converts and runs on a **stock ncnn wheel**. Default keeps the **in-graph argmin** scalar outputs — the graph runs `torch.argmin` + a dynamic-index `Crop` (gather), which a stock ncnn wheel **can't** run (ncnn has **no `ArgMin` layer** and no `Gather`), so that path needs a custom layer. |
 
 ```bash
 # Classify val/ + test/ images with the PyTorch prototypes (no export)
@@ -92,33 +93,54 @@ Notes:
   run **through the exported model** (ONNX / TorchScript), not the PyTorch prototypes — so any
   conversion discrepancy surfaces immediately. With no export, predictions use the in-memory
   PyTorch prototypes.
-- Both exports write **`<path>.meta.json`** = `{class_names, thresholds, img_size, mean, std}` —
-  `thresholds` is a per-class list aligned with `class_names`. The client (and `--load-onnx`) reads
-  this to map an output index to a class name.
+- Both exports write **`<path>.meta.json`** = `{class_names, thresholds, img_size, mean, std, no_argmin}` —
+  `thresholds` is a per-class list aligned with `class_names`; `no_argmin` records which output
+  format was baked in. The client (and `--load-onnx`) reads this to map an output index to a class
+  name and to know whether to expect scalar or per-class-vector outputs.
 
 ---
 
 ## 3. The open-set model — input & output
 
 Both exports wrap the backbone in the **same** `_OpenSetWrapper` (ONNX and TorchScript are the
-identical graph), so ncnn computes exactly what PyTorch does.
+identical graph), so ncnn computes exactly what PyTorch does. Prototypes and the **per-class
+threshold vector** are **baked into the graph as constants**, so at runtime the client only feeds
+the image.
 
-**Input**
+**Input** (both modes)
 
 | name | shape | dtype | notes |
 |---|---|---|---|
 | `image` | `[1, 3, 224, 224]` | float32 | RGB, **squash**-resized to 224×224, normalized `mean=std=0.5` |
 
-**Output** (3 tensors)
+**Output** — depends on `--no-argmin`:
+
+**(A) default — in-graph argmin (scalar outputs)**
 
 | name | shape | dtype | meaning |
 |---|---|---|---|
 | `best_class_idx` | scalar | int64 | index of nearest prototype → `class_names[idx]` |
-| `best_dist` | scalar | float32 | cosine distance to that prototype (0 = identical, higher = less similar) |
-| `margin` | scalar | float32 | `best_dist − threshold[best_class]` (per-class); **< 0 = known**, **> 0 = unknown (reject)** |
+| `best_dist` | scalar | float32 | cosine distance to that prototype |
+| `margin` | scalar | float32 | `best_dist − threshold[best_class]`; **< 0 = known**, **> 0 = unknown** |
 
-Prototypes and the **per-class threshold vector** are **baked into the graph as constants**, so at
-runtime the client only feeds the image — and the reject decision is simply `margin > 0`.
+The graph does the `argmin` + gather itself, so the client just reads the scalars. **But** a
+**stock pip ncnn wheel can't run it**: PNNX emits a `torch.argmin` node plus a dynamic-index `Crop`
+(the gather), and ncnn has **no `ArgMin` layer at all** and no `Gather`
+(`layer torch.argmin not exists or registered` → `network graph not ready`). Use this only with a
+**custom decision layer** (see §6). (For reference: ncnn *does* ship an `ArgMax` layer, but it is
+`OFF` by default; `ArgMin` does not exist at all.)
+
+**(B) `--no-argmin` — client-side argmin (per-class vectors)**
+
+| name | shape | dtype | meaning |
+|---|---|---|---|
+| `dists` | `[1, C]` | float32 | cosine distance to **every** class prototype |
+| `margins` | `[1, C]` | float32 | `dists[c] − threshold[c]` (per-class) |
+
+The graph stops at the vectors; the client does `best = argmin(dists)`, `unknown = margins[best] > 0`.
+Only conv, L2-normalize, matmul and subtract remain — all universally supported — so it **converts
+and runs on a stock ncnn wheel**. Recommended unless you specifically need the model to emit the
+decision itself.
 
 ---
 
@@ -129,6 +151,11 @@ Two routes — both start from the identical `_OpenSetWrapper`. Install tools on
 ```bash
 uv pip install pnnx ncnn        # (onnx already present for the ONNX route)
 ```
+
+> **Which export for ncnn?** For a **stock pip ncnn wheel**, export with **`--no-argmin`** (§3B) —
+> the graph is `Normalize → matmul → subtract` and runs as-is. The **default** in-graph-argmin
+> export emits `torch.argmin` + a gather that a stock wheel can't run (§3A); use it only if you add
+> the custom decision layer from **§6**.
 
 ### Route A — direct: TorchScript → ncnn  (leaner graph, recommended)
 
@@ -161,7 +188,10 @@ you prefer reusing the existing ONNX export.
 
 ## 5. How the client uses the output
 
-The client (ncnn app) does: **preprocess → run → interpret the 3 outputs**.
+This shows the **`--no-argmin`** export (mode B) — the recommended, stock-ncnn-compatible one. The
+client does: **preprocess → run → argmin over the 2 output vectors**. (For the default scalar
+export, the client instead reads `best_class_idx`/`best_dist`/`margin` directly — but that graph
+needs a custom decision layer on ncnn, see §3A / §6.)
 
 ```python
 import numpy as np, ncnn, json
@@ -179,45 +209,89 @@ mat = ncnn.Mat.from_pixels(np.array(img), ncnn.Mat.PixelType.PIXEL_RGB, 224, 224
 mat.substract_mean_normalize([127.5, 127.5, 127.5], [1/127.5, 1/127.5, 1/127.5])
 
 ex = net.create_extractor()
-ex.input('image', mat)                      # input/output blob names: see openset.ncnn.param
-_, idx    = ex.extract('best_class_idx')
-_, dist   = ex.extract('best_dist')
-_, margin = ex.extract('margin')
+ex.input('in0', mat)                        # input/output blob names: see openset.ncnn.param
+dists   = np.array(ex.extract('out0')[1])   # [C] cosine distance to each prototype
+margins = np.array(ex.extract('out1')[1])   # [C] dists[c] - threshold[c]
 
-best_idx = int(np.array(idx)[0])
-if float(np.array(margin)[0]) > 0:          # margin > 0 → unknown
+best_idx = int(dists.argmin())              # nearest prototype (argmin done on the CLIENT)
+if margins[best_idx] > 0:                    # margin > 0 → unknown
     result = 'unknown / new product'
 else:
     result = meta['class_names'][best_idx]  # known product
-print(result, 'dist=', float(np.array(dist)[0]))
+print(result, 'dist=', float(dists[best_idx]))
 ```
+
+> Blob names: PNNX names the input `in0` and the outputs `out0` (`dists`) / `out1` (`margins`) —
+> confirm against the top of `openset.ncnn.param` / the generated `*_ncnn.py`.
 
 Client rules:
 1. **Preprocess identically** to export — squash-resize to 224×224 (because training used
    `--crop-mode=squash`), RGB, `substract_mean_normalize([127.5]*3, [1/127.5]*3)`. This is the #1
    source of "correct in PyTorch, wrong in ncnn."
-2. **Decision:** `margin > 0` (equivalently `best_dist > thresholds[best_class_idx]`) ⇒ **reject as
-   unknown**; otherwise the product is `class_names[best_class_idx]`. The per-class threshold is
-   already baked into `margin`, so the client just checks its sign.
+2. **Decision:** `best = argmin(dists)`; `margins[best] > 0` (equivalently `dists[best] >
+   thresholds[best]`) ⇒ **reject as unknown**; otherwise the product is `class_names[best]`. The
+   per-class threshold is already baked into `margins`, so the client just checks the sign at the
+   nearest class.
 3. **Index → name** via `meta.json`'s `class_names` (order matches the exported prototype matrix
    and the `thresholds` list).
-4. **Retuning thresholds without re-export:** the per-class thresholds are fixed in the graph at
-   export time. To adjust, re-export (e.g. change `threshold_quantile` in `build_prototypes`), or
-   export a distance-vector variant and apply `dists > meta['thresholds']` in the client.
+4. **Retuning thresholds without re-export:** the per-class thresholds are baked into `margins`. To
+   adjust without re-exporting, ignore `margins` and apply your own rule on `dists` directly, e.g.
+   `dists > np.array(meta['thresholds'])` (or scale them) in the client.
 
 ---
 
-## TL;DR
+## 6. Default (in-graph argmin) on ncnn — custom decision layer
+
+If you want the model itself to emit the decision (the default, non-`--no-argmin` export) on ncnn,
+you must supply the missing op. ncnn has no `ArgMin` and no `Gather`, so don't try to add those two
+separately — implement the **whole head as one custom layer** that takes `dists` in and outputs
+`(best_idx, best_dist, unknown)`:
+
+```cpp
+// nptools/openset_decide.cpp  — register before load_param()
+#include "layer.h"
+using namespace ncnn;
+class OpenSetDecide : public Layer {
+public:
+    OpenSetDecide() { one_blob_only = true; }
+    virtual int load_param(const ParamDict& pd) { thr = pd.get(0, Mat()); return 0; }   // -23300=C,thr0,...
+    virtual int forward(const Mat& dists, Mat& top, const Option&) const {
+        const float* d = dists; int best = 0; float bd = d[0];
+        for (int c = 1; c < dists.w; c++) if (d[c] < bd) { bd = d[c]; best = c; }        // argmin
+        const float* t = thr;
+        top.create(3); top[0] = (float)best; top[1] = bd; top[2] = (bd > t[best]) ? 1.f : 0.f;
+        return 0;
+    }
+private: Mat thr;
+};
+DEFINE_LAYER_CREATOR(OpenSetDecide)
+```
+```cpp
+net.register_custom_layer("OpenSetDecide", OpenSetDecide_layer_creator);
+net.load_param("openset.ncnn.param");   // hand-edit the argmin/Crop tail → one OpenSetDecide line
+net.load_model("openset.ncnn.bin");
+```
+
+This is C++ only (the pip wheel can't register a pure-Python custom layer). In practice the
+**`--no-argmin` route is simpler and portable** — same result with no custom layer — so prefer it
+unless your app framework must have the model emit the final decision.
+
+---
+
+## TL;DR (recommended: `--no-argmin`, runs on stock ncnn)
 
 ```bash
 # 1. build open-set model from checkpoint + training data (classes from class-map), export it
 uv run --no-sync python nptools/openset.py \
     --data-dir posmlv --class-map posmlv/class_84.txt \
-    --checkpoint <run>/model_best.pth.tar --export-pt nptools/openset.pt   # (or --export-onnx)
+    --checkpoint <run>/model_best.pth.tar --no-argmin --export-pt nptools/openset.pt  # (or --export-onnx)
 
 # 2. convert to ncnn
 cd nptools && pnnx openset.pt inputshape=[1,3,224,224]                       # → openset.ncnn.*
 
-# 3. client: preprocess (squash 224 + mean/std 0.5) → run → 
-#    margin>0 ⇒ unknown ; else class_names[best_class_idx]  (names/thresholds in openset.pt.meta.json)
+# 3. client: preprocess (squash 224 + mean/std 0.5) → run → best=argmin(dists) →
+#    margins[best]>0 ⇒ unknown ; else class_names[best]  (names/thresholds in openset.pt.meta.json)
 ```
+
+(Drop `--no-argmin` to bake the decision into the graph instead — but then deploy with the §6
+custom layer.)

@@ -311,6 +311,13 @@ group.add_argument('--bce-target-thresh', type=float, default=None,
                    help='Threshold for binarizing softened BCE targets (default: None, disabled).')
 group.add_argument('--bce-pos-weight', type=float, default=None,
                    help='Positive weighting for BCE loss.')
+group.add_argument('--arcface', action='store_true', default=False,
+                   help='Train with an ArcFace angular-margin head (open-set-friendly features; '
+                        'see nptools/arcfaceloss.py). Consume the checkpoint via nptools/openset.py.')
+group.add_argument('--arcface-s', type=float, default=30.0,
+                   help='ArcFace feature scale s (default: 30.0)')
+group.add_argument('--arcface-m', type=float, default=0.50,
+                   help='ArcFace angular margin m in radians (default: 0.50)')
 group.add_argument('--reprob', type=float, default=0., metavar='PCT',
                    help='Random erase prob (default: 0.)')
 group.add_argument('--remode', type=str, default='pixel',
@@ -947,6 +954,22 @@ def main():
             train_loss_fn = LabelSmoothingCrossEntropy(smoothing=args.smoothing)
     else:
         train_loss_fn = nn.CrossEntropyLoss()
+    if args.arcface:
+        # Wrap the chosen base criterion in an ArcFace angular-margin head. The head owns the
+        # class-weight matrix (training-only) and composes the base loss over its scaled logits.
+        from nptools.arcfaceloss import ArcFaceLoss
+        train_loss_fn = ArcFaceLoss(
+            in_features=model.num_features,
+            num_classes=args.num_classes,
+            s=args.arcface_s,
+            m=args.arcface_m,
+            base_criterion=train_loss_fn,
+        )
+        if utils.is_primary(args):
+            _logger.info(
+                f'ArcFace enabled: s={args.arcface_s} m={args.arcface_m} '
+                f'in_features={model.num_features} num_classes={args.num_classes}'
+            )
     train_loss_fn = train_loss_fn.to(device=device)
     validate_loss_fn = nn.CrossEntropyLoss().to(device=device)
 
@@ -994,6 +1017,17 @@ def main():
             )
         else:
             raise ValueError(f"Unknown distillation type: {args.kd_distill_type}")
+    elif args.arcface:
+        # ArcFace task: backbone keeps its normal classifier (checkpoint stays openset-compatible);
+        # the margin head (train_loss_fn) is a training-only module owned by the task.
+        from nptools.arcfaceloss import ArcFaceTask
+        task = ArcFaceTask(
+            model=model,
+            criterion=train_loss_fn,
+            device=device,
+            dtype=model_dtype,
+            verbose=utils.is_primary(args),
+        )
     else:
         # Standard classification task
         task = ClassificationTask(
@@ -1006,12 +1040,22 @@ def main():
 
     model = task.get_trainable_module()
     eval_model = task.get_eval_model()
+    # ArcFace scores validation with the (training-only) margin head's cosine logits, since the
+    # backbone's own softmax classifier is not trained under ArcFace.
+    arcface_head = task.criterion if args.arcface else None
 
     optimizer = create_optimizer_v2(
         model,
         **optimizer_kwargs(cfg=args),
         **args.opt_kwargs,
     )
+    if args.arcface:
+        # The ArcFace head weight lives on the task's criterion, not in the backbone, so
+        # create_optimizer_v2 (over the backbone) misses it — add it as its own param group.
+        optimizer.add_param_group({
+            'params': list(task.criterion.parameters()),
+            'weight_decay': args.weight_decay,
+        })
     if utils.is_primary(args):
         defaults = copy.deepcopy(optimizer.defaults)
         defaults['weight_decay'] = args.weight_decay  # this isn't stored in optimizer.defaults
@@ -1142,6 +1186,38 @@ def main():
             f'LR stepped per {"epoch" if lr_scheduler.t_in_epochs else "update"}.')
 
     results = []
+
+    # evaluate the val set immediately after resuming, before any further training
+    if args.resume and resume_epoch is not None and loader_eval is not None:
+        if utils.is_primary(args):
+            _logger.info(f"Evaluating val set on resumed checkpoint (epoch {resume_epoch})")
+        resume_eval_metrics = validate(
+            eval_model,
+            loader_eval,
+            validate_loss_fn,
+            args,
+            device=device,
+            amp_autocast=amp_autocast,
+            model_dtype=model_dtype,
+            arcface_head=arcface_head,
+        )
+        ema_model = task.get_trainable_module(ema=True)
+        if ema_model is not None and not args.model_ema_force_cpu:
+            resume_eval_metrics = validate(
+                task.get_eval_model(ema=True),
+                loader_eval,
+                validate_loss_fn,
+                args,
+                device=device,
+                amp_autocast=amp_autocast,
+                log_suffix=' (EMA)',
+                arcface_head=arcface_head,
+            )
+        if utils.is_primary(args):
+            metrics_str = '  '.join(f'{k}: {v:.4f}' for k, v in resume_eval_metrics.items())
+            _logger.info(f'Resumed checkpoint (epoch {resume_epoch}) val metrics:  {metrics_str}')
+        # record so the final --result summary isn't empty when resuming at the last epoch
+        results.append({'epoch': resume_epoch, 'validation': resume_eval_metrics})
     try:
         for epoch in range(start_epoch, num_epochs):
             _set_loader_epoch(loader_train, epoch)
@@ -1193,6 +1269,7 @@ def main():
                     device=device,
                     amp_autocast=amp_autocast,
                     model_dtype=model_dtype,
+                    arcface_head=arcface_head,
                 )
 
                 ema_model = task.get_trainable_module(ema=True)
@@ -1208,6 +1285,7 @@ def main():
                         device=device,
                         amp_autocast=amp_autocast,
                         log_suffix=' (EMA)',
+                        arcface_head=arcface_head,
                     )
                     eval_metrics = ema_eval_metrics
             else:
@@ -1499,7 +1577,8 @@ def validate(
         device=torch.device('cuda'),
         amp_autocast=suppress,
         model_dtype=None,
-        log_suffix=''
+        log_suffix='',
+        arcface_head=None,
 ):
     batch_time_m = utils.AverageMeter()
     losses_m = utils.AverageMeter()
@@ -1526,7 +1605,15 @@ def validate(
                 input = input.contiguous(memory_format=torch.channels_last)
 
             with amp_autocast():
-                output = model(input)
+                if arcface_head is not None:
+                    # ArcFace: the backbone's own classifier is untrained; score with the
+                    # margin head's no-margin cosine logits instead. Unwrap DDP/EMA to reach
+                    # forward_features / forward_head.
+                    net = model.module if hasattr(model, 'module') else model
+                    feat = net.forward_head(net.forward_features(input), pre_logits=True)
+                    output = arcface_head.logits(feat)
+                else:
+                    output = model(input)
                 if isinstance(output, (tuple, list)):
                     output = output[0]
 

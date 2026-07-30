@@ -180,51 +180,86 @@ class _OpenSetWrapper(torch.nn.Module):
 
     Uses a PER-CLASS threshold vector (each class judged against its own distance spread).
 
-    Outputs:
-        best_class_idx  – int64 scalar: index into class_names
-        best_dist       – float32 scalar: cosine distance to nearest prototype
-        margin          – float32 scalar: best_dist - threshold[best_class]
-                          negative → known class, positive → unknown
+    Two output modes (selected by ``no_argmin``):
+
+    - ``no_argmin=False`` (default) — IN-GRAPH argmin: the nearest-prototype selection and
+      the reject decision are baked into the graph, so the model emits scalars directly. This needs
+      the ncnn runtime to support ArgMin + the dynamic-index Crop (gather); a stock pip ncnn wheel
+      does not (ncnn has no ``ArgMin`` layer at all; its ``ArgMax`` layer exists but is OFF by
+      default and is a different op), so deploy with a custom layer.
+      Outputs: ``best_class_idx`` (int64 scalar), ``best_dist`` (float32), ``margin`` (float32; >0
+      → unknown).
+
+    - ``no_argmin=True`` — CLIENT-SIDE argmin: the graph emits only per-class vectors and the
+      argmin + reject move to the client. Every remaining op (conv, L2-normalize, matmul, subtract)
+      is universally supported, so it converts and runs on a stock ncnn wheel.
+      Outputs: ``dists`` (float32 [1, C]), ``margins`` (float32 [1, C]).
+      Client: ``best = argmin(dists); unknown = margins[best] > 0; name = class_names[best]``.
     """
 
-    def __init__(self, backbone: torch.nn.Module, proto_mat: torch.Tensor, thresh_vec: torch.Tensor):
+    def __init__(
+            self,
+            backbone: torch.nn.Module,
+            proto_mat: torch.Tensor,
+            thresh_vec: torch.Tensor,
+            no_argmin: bool = False,
+    ):
         super().__init__()
         self.backbone = backbone
+        self.no_argmin = no_argmin
         self.register_buffer('proto_mat', proto_mat)   # [C, D], L2-normalized
         self.register_buffer('thresh', thresh_vec.to(torch.float32))  # [C] per-class thresholds
 
     def forward(self, x: torch.Tensor) -> tuple:
-        feat = self.backbone.forward_head(self.backbone.forward_features(x), pre_logits=True)
-        feat = F.normalize(feat, dim=1).squeeze(0)          # [D]
-        dists = 1.0 - (self.proto_mat @ feat)               # [C] cosine distances
+        feat = self.backbone.forward_head(self.backbone.forward_features(x), pre_logits=True)  # [1, D]
+        feat = F.normalize(feat, dim=1)                     # [1, D] unit vector
+
+        if self.no_argmin:
+            # Client-side argmin: emit per-class vectors only (no argmax/gather in the graph).
+            sims = feat @ self.proto_mat.t()                # [1, C] cosine similarity
+            dists = 1.0 - sims                              # [1, C] cosine distance
+            margins = dists - self.thresh                   # [1, C] per-class reject margin (>0 unknown)
+            return dists, margins
+
+        # In-graph argmin: nearest prototype is the smallest cosine distance.
+        feat = feat.squeeze(0)                              # [D]
+        sims = self.proto_mat @ feat                        # [C] cosine similarities
+        dists = 1.0 - sims                                  # [C] cosine distances
         best_idx = dists.argmin()
-        best_dist = dists[best_idx]
+        best_dist = dists[best_idx]                         # cosine distance of the nearest prototype
         margin = best_dist - self.thresh[best_idx]           # per-class; >0 → unknown, <0 → known
         return best_idx, best_dist, margin
 
 
 @torch.no_grad()
-def export_openset_pt(model, prototypes, class_names, thresholds, output_path, img_size=224):
+def export_openset_pt(model, prototypes, class_names, thresholds, output_path, img_size=224,
+                      no_argmin=False):
     """Trace the open-set model (_OpenSetWrapper) to a TorchScript .pt for PNNX → ncnn.
 
     Uses the SAME _OpenSetWrapper as export_openset_onnx, so the ONNX and TorchScript exports are
     the identical model. Per-class thresholds are baked in. Also writes a sidecar
-    <output_path>.meta.json with the class order and per-class thresholds (index→name).
+    <output_path>.meta.json with the class order, per-class thresholds (index→name), and the
+    ``no_argmin`` flag so the predict/load paths know the output format.
+
+    Args:
+        no_argmin: if True, export the client-side-argmin variant (per-class ``dists``/``margins``
+            vectors, no argmax/gather in the graph); if False, the in-graph argmin scalar outputs.
     """
     import json
     proto_mat = torch.stack([prototypes[c] for c in class_names]).cpu()  # [C, D]
     thresh_vec = torch.tensor([thresholds[c] for c in class_names])      # [C]
     # trace on CPU so the .pt is portable and PNNX/ncnn-friendly
-    net = _OpenSetWrapper(model.cpu(), proto_mat, thresh_vec).eval()
+    net = _OpenSetWrapper(model.cpu(), proto_mat, thresh_vec, no_argmin=no_argmin).eval()
     example = torch.zeros(1, 3, img_size, img_size)
     ts = torch.jit.trace(net, example)
     ts.save(output_path)
     meta = {'class_names': list(class_names),
             'thresholds': [float(thresholds[c]) for c in class_names],
-            'img_size': img_size, 'mean': list(MEAN), 'std': list(STD)}
+            'img_size': img_size, 'mean': list(MEAN), 'std': list(STD), 'no_argmin': no_argmin}
     with open(output_path + '.meta.json', 'w') as f:
         json.dump(meta, f, indent=2)
-    print(f'TorchScript open-set model → {output_path}')
+    outputs = 'dists, margins (client argmin)' if no_argmin else 'best_class_idx, best_dist, margin'
+    print(f'TorchScript open-set model → {output_path}  [outputs: {outputs}]')
     print(f'  meta (classes + per-class thresholds) → {output_path}.meta.json')
     print(f'  next: pnnx {output_path} inputshape=[1,3,{img_size},{img_size}]')
 
@@ -237,6 +272,7 @@ def export_openset_onnx(
         thresholds: dict,
         output_path: str,
         img_size: int = 224,
+        no_argmin: bool = False,
 ) -> None:
     """Export the full open-set pipeline as a single ONNX graph.
 
@@ -250,20 +286,23 @@ def export_openset_onnx(
         thresholds: Dict mapping class name → per-class cosine-distance reject threshold.
         output_path: Destination .onnx file path.
         img_size: Square input size for the exported graph.
+        no_argmin: if True, export the client-side-argmin variant (per-class ``dists``/``margins``
+            vectors, no argmax/gather in the graph); if False, the in-graph argmin scalar outputs.
     """
     proto_mat = torch.stack([prototypes[c] for c in class_names])  # [C, D]
     device = next(model.parameters()).device
     thresh_vec = torch.tensor([thresholds[c] for c in class_names], device=device)  # [C]
 
-    wrapper = _OpenSetWrapper(model, proto_mat.to(device), thresh_vec).eval()
+    wrapper = _OpenSetWrapper(model, proto_mat.to(device), thresh_vec, no_argmin=no_argmin).eval()
 
+    output_names = ['dists', 'margins'] if no_argmin else ['best_class_idx', 'best_dist', 'margin']
     dummy = torch.zeros(1, 3, img_size, img_size, device=device)
     torch.onnx.export(
         wrapper,
         dummy,
         output_path,
         input_names=['image'],
-        output_names=['best_class_idx', 'best_dist', 'margin'],
+        output_names=output_names,
         opset_version=17,
         dynamic_axes={'image': {0: 'batch_size'}},
         dynamo=False,
@@ -271,7 +310,7 @@ def export_openset_onnx(
     import json
     meta = {'class_names': list(class_names),
             'thresholds': [float(thresholds[c]) for c in class_names],
-            'img_size': img_size, 'mean': list(MEAN), 'std': list(STD)}
+            'img_size': img_size, 'mean': list(MEAN), 'std': list(STD), 'no_argmin': no_argmin}
     with open(output_path + '.meta.json', 'w') as f:
         json.dump(meta, f, indent=2)
     print(f'ONNX exported → {output_path}')
@@ -310,6 +349,7 @@ def predict_onnx(
         transform,
         class_names: list,
         img_path: str,
+        no_argmin: bool = False,
 ) -> tuple:
     """Run open-set inference on a single image using an ONNX session.
 
@@ -318,6 +358,8 @@ def predict_onnx(
         transform: Same torchvision transform used during training.
         class_names: Ordered class names matching the exported prototype matrix.
         img_path: Path to the input image.
+        no_argmin: True if the model was exported with client-side argmin (outputs the per-class
+            ``dists``/``margins`` vectors); False for the in-graph scalar outputs.
 
     Returns:
         Tuple of (label, best_dist, nearest_class) where label is 'unknown'
@@ -325,6 +367,14 @@ def predict_onnx(
     """
     img = Image.open(img_path).convert('RGB')
     x = transform(img).unsqueeze(0).numpy()           # [1, 3, H, W] float32
+    if no_argmin:
+        dists, margins = session.run(['dists', 'margins'], {'image': x})
+        dists, margins = dists[0], margins[0]         # [C] (drop batch dim)
+        best_idx = int(dists.argmin())                # argmin on the client
+        best_dist = float(dists[best_idx])
+        nearest = class_names[best_idx]
+        label = 'unknown' if float(margins[best_idx]) > 0 else nearest
+        return label, best_dist, nearest
     best_idx, best_dist, margin = session.run(
         ['best_class_idx', 'best_dist', 'margin'],
         {'image': x},
@@ -337,13 +387,23 @@ def predict_onnx(
 
 
 @torch.no_grad()
-def predict_pt(ts_model, transform, class_names, img_path):
+def predict_pt(ts_model, transform, class_names, img_path, no_argmin=False):
     """Run open-set inference on one image via a TorchScript open-set model (CPU).
 
     Returns (label, best_dist, nearest) — 'unknown' when the baked-in per-class margin > 0.
+    ``no_argmin`` mirrors the export flag: True → the model returns per-class ``dists``/``margins``
+    vectors and the argmin is done here; False → the model returns the scalar decision directly.
     """
     img = Image.open(img_path).convert('RGB')
     x = transform(img).unsqueeze(0)                    # [1, 3, H, W] float32
+    if no_argmin:
+        dists, margins = ts_model(x)
+        dists, margins = dists[0], margins[0]          # [C] (drop batch dim)
+        best_idx = int(dists.argmin())                 # argmin on the client
+        best_dist = float(dists[best_idx])
+        nearest = class_names[best_idx]
+        label = 'unknown' if float(margins[best_idx]) > 0 else nearest
+        return label, best_dist, nearest
     best_idx, best_dist, margin = ts_model(x)
     best_idx = int(best_idx)
     best_dist = float(best_dist)
@@ -377,6 +437,12 @@ def main():
         help='run inference via ONNX (CPU); skips PyTorch model and prototype building. '
              'Class names are read from <PATH>.meta.json written at export.',
     )
+    parser.add_argument(
+        '--no-argmin', action='store_true', default=False,
+        help='export the client-side-argmin variant: the model emits per-class dists/margins '
+             'vectors (no argmax/gather in the graph) and the argmin + reject move to the client. '
+             'Converts/runs on a stock ncnn wheel. Default keeps the in-graph argmin scalar outputs.',
+    )
     args = parser.parse_args()
 
     transform = build_transform(args.img_size)
@@ -390,14 +456,18 @@ def main():
                 f'{meta_path} not found. The exporter writes it next to the model; it holds the '
                 f'exact class order baked into the model (needed to label predictions).'
             )
-        class_names = json.load(open(meta_path))['class_names']
+        meta = json.load(open(meta_path))
+        class_names = meta['class_names']
+        no_argmin = meta.get('no_argmin', False)      # output format baked at export time
         print(f'ONNX model : {args.load_onnx}')
-        print(f'Classes    : {len(class_names)} (from {meta_path})\n')
+        print(f'Classes    : {len(class_names)} (from {meta_path})')
+        print(f'Output     : {"dists/margins (client argmin)" if no_argmin else "scalar (in-graph argmin)"}\n')
         session = load_openset_onnx(args.load_onnx)
         img_paths = [args.image] if args.image else _scan_eval_images(args.data_dir)
         print(f'  prediction via ONNX model')
         for img_path in img_paths:
-            label, dist, nearest = predict_onnx(session, transform, class_names, img_path)
+            label, dist, nearest = predict_onnx(session, transform, class_names, img_path,
+                                                no_argmin=no_argmin)
             print(f'{img_path}')
             print(f'  → prediction: {label}  (nearest known: {nearest}, dist={dist:.4f})')
         return
@@ -428,12 +498,12 @@ def main():
     if args.export_onnx is not None:
         onnx_path = args.export_onnx or os.path.splitext(checkpoint)[0] + '_openset.onnx'
         export_openset_onnx(model, prototypes, class_names, thresholds, onnx_path,
-                            img_size=args.img_size)
+                            img_size=args.img_size, no_argmin=args.no_argmin)
 
     if args.export_pt is not None:
         pt_path = args.export_pt or os.path.splitext(checkpoint)[0] + '_openset.pt'
         export_openset_pt(model, prototypes, class_names, thresholds, pt_path,
-                          img_size=args.img_size)
+                          img_size=args.img_size, no_argmin=args.no_argmin)
 
     if args.image:
         img_paths = [args.image]
@@ -446,11 +516,11 @@ def main():
     if onnx_path is not None:
         session = load_openset_onnx(onnx_path)
         print(f'Predicting via exported ONNX model: {onnx_path}\n')
-        predict = lambda p: predict_onnx(session, transform, class_names, p)
+        predict = lambda p: predict_onnx(session, transform, class_names, p, no_argmin=args.no_argmin)
     elif pt_path is not None:
         ts_model = torch.jit.load(pt_path).eval()
         print(f'Predicting via exported TorchScript model: {pt_path}\n')
-        predict = lambda p: predict_pt(ts_model, transform, class_names, p)
+        predict = lambda p: predict_pt(ts_model, transform, class_names, p, no_argmin=args.no_argmin)
     else:
         print('Predicting via in-memory PyTorch prototypes\n')
         predict = lambda p: predict_openset(

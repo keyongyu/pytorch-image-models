@@ -7,6 +7,10 @@ export NOBG_BG_DIR=/home/keyong/cls6/bg_photos
 DATA_DIR=/home/keyong/cls2/code/posmlv
 OUTPUT_DIR=/home/keyong/cls2/code/posmlv/output
 
+ # Preserve args passed to this script (e.g. --per-class-acc) so they reach train.py.
+ # Must capture BEFORE `set --` below repurposes $@ as the python interpreter prefix.
+ EXTRA_ARGS="$*"
+
  if [ "${DEBUGPY:-0}" = "1" ]; then
      set -- -m debugpy \
          --listen 127.0.0.1:5678 \
@@ -46,7 +50,8 @@ fi
      --class-map="${DATA_DIR}/class_84.txt" \
      --output="${OUTPUT_DIR}" \
      --num-classes=83 \
-     ${RESUME_OR_NEW}
+     ${RESUME_OR_NEW} \
+     ${EXTRA_ARGS}
      #--bg-dir="${DATA_DIR}/bg_photos" \
 
 
