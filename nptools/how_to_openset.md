@@ -9,11 +9,22 @@ own docs for depth:
 - open-set model + export — [`openset.md`](openset.md) (`nptools/openset.py`)
 
 ```
- videos ─► extract_object.py ─► train/<class>/nobg_*.png ─► reduce_imbalance.py ─┐
-                                                                                ├─► train_posm.sh (ArcFace) ─► checkpoint
- class map (class_84.txt) ──────────────────────────────────────────────────────┘                                │
-                                                                                           ▼
-                                            openset.py (prototypes + per-class thresholds) ─► .pt/.onnx (+meta.json) ─► pnnx ─► .ncnn.param/.bin
+ per-class videos
+      │
+      ▼
+ extract_object.py   ─►  train/<class>/nobg_*.png (+ .jpg)
+      │
+      ▼
+ reduce_imbalance.py   (balance train/ by symlink-oversampling)
+      │
+      ▼
+ train_posm.sh   (ArcFace; --nobg bg-swap)   ─►  checkpoint   ◄─ needs: class map, bg photos (NOBG_BG_DIR)
+      │
+      ▼
+ openset.py   (prototypes + per-class thresholds)   ─►  .pt / .onnx (+ meta.json)   ◄─ needs: class map
+      │
+      ▼
+ pnnx   ─►  .ncnn.param / .ncnn.bin
 ```
 
 Conventions below use `<DATA>` for the dataset root (e.g. `posmlv`) and `tf_efficientnet_lite0` as
@@ -132,6 +143,19 @@ python -m nptools.reduce_imbalance --data-dir <DATA> --split train
 
 `train_posm.sh` wraps `train.py` with the posm defaults (`--nobg` bg-swap, `--crop-mode=squash`,
 `tf_efficientnet_lite0`, etc.). Add `--arcface` for open-set-friendly embeddings:
+
+**Background folder (required for `--nobg`).** The bg-swap composites each `nobg_*.png` cutout onto a
+random photo from a **background-image folder** every epoch — this is what breaks the shared-video
+background leak. Point the `NOBG_BG_DIR` env var at a folder of varied scene photos (any
+jpg/jpeg/png, searched recursively). `train_posm.sh` sets it near the top:
+
+```sh
+export NOBG_BG_DIR=/path/to/bg_photos   # edit this in nptools/train_posm.sh
+```
+
+`train.py` **fails fast** if `--nobg` is set but `NOBG_BG_DIR` is unset/empty or contains no images,
+so set it before training. Use general background scenes (shelves, streets, rooms) — not more
+product images.
 
 ```bash
 sh nptools/train_posm.sh \
