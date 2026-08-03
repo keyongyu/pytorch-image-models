@@ -9,9 +9,9 @@ own docs for depth:
 - open-set model + export — [`openset.md`](openset.md) (`nptools/openset.py`)
 
 ```
- videos ─► extract_object.py ─► train/<class>/nobg_*.png ─┐
-                                                          ├─► train_posm.sh (ArcFace) ─► checkpoint
- class map (class_84.txt) ────────────────────────────────┘                                │
+ videos ─► extract_object.py ─► train/<class>/nobg_*.png ─► reduce_imbalance.py ─┐
+                                                                                ├─► train_posm.sh (ArcFace) ─► checkpoint
+ class map (class_84.txt) ──────────────────────────────────────────────────────┘                                │
                                                                                            ▼
                                             openset.py (prototypes + per-class thresholds) ─► .pt/.onnx (+meta.json) ─► pnnx ─► .ncnn.param/.bin
 ```
@@ -49,7 +49,7 @@ Per kept frame you get an aligned pair in `<DATA>/train/<class>/`:
 
 **Which to keep for training?** For video-sourced classes the frames all share one background, so a
 plain photo would leak that background as a shortcut. **Use the `nobg_*.png`** — under `--nobg`
-(step 6) they are composited onto random backgrounds (bg-swap), which breaks the leak. If you don't
+(step 7) they are composited onto random backgrounds (bg-swap), which breaks the leak. If you don't
 want the background-kept JPGs trained on, delete them (or keep only the PNGs):
 
 ```bash
@@ -105,7 +105,30 @@ Eyeball `/tmp/aug_check/posm_18/` — confirm the object (and its foot) survives
 
 ---
 
-## 6. Train the ArcFace classifier
+## 6. Reduce class imbalance (oversample minority classes)
+
+Classes built from video have very different image counts (a 142-frame clip vs a 51-frame one, and a
+large `others`). `reduce_imbalance.py` evens the training signal by **symlink-oversampling**: every
+class with fewer than `--ratio` × the largest class's image count is topped up to that count with
+symlinks to its own images (cycled). Symlinks keep disk usage flat, and because training re-augments
+each epoch, a symlinked duplicate behaves like a fresh sample — balancing per-class gradients (and
+ArcFace prototypes) without memorization.
+
+```bash
+# preview the plan
+python -m nptools.reduce_imbalance --data-dir <DATA> --split train --dry-run
+# apply (default --ratio 0.5 = top minority classes up to half the largest class's count)
+python -m nptools.reduce_imbalance --data-dir <DATA> --split train
+```
+
+- **Idempotent:** each run first removes its own previous symlinks (marked `imbaldup_`) and recounts
+  the real images — safe to re-run after adding more cutouts; it won't stack duplicates.
+- Only touches `train/`, and the symlinks it creates are **skipped when composing the validation
+  set**, so eval isn't polluted with duplicates.
+
+---
+
+## 7. Train the ArcFace classifier
 
 `train_posm.sh` wraps `train.py` with the posm defaults (`--nobg` bg-swap, `--crop-mode=squash`,
 `tf_efficientnet_lite0`, etc.). Add `--arcface` for open-set-friendly embeddings:
@@ -127,7 +150,7 @@ sh nptools/train_posm.sh \
 
 ---
 
-## 7. Build & export the open-set model
+## 8. Build & export the open-set model
 
 `openset.py` loads the checkpoint, builds an L2-normalized **prototype** (mean pre-logits feature)
 per class, computes a **per-class reject threshold**, and exports a deployable model.
@@ -156,7 +179,7 @@ Threshold theory, per-class vs global, `others`-as-negatives, and ncnn conversio
 
 ---
 
-## 8. Convert to ncnn with pnnx
+## 9. Convert to ncnn with pnnx
 
 Turn the exported `.pt` (or `.onnx`) into ncnn files for on-device deployment. Install the tools
 once, then run pnnx with the model's input shape:
@@ -164,10 +187,10 @@ once, then run pnnx with the model's input shape:
 ```bash
 uv pip install pnnx ncnn                                   # once
 cd nptools && pnnx openset.pt inputshape=[1,3,224,224]     # or: pnnx openset.onnx inputshape=[1,3,224,224]
-#   → openset.ncnn.param + openset.ncnn.bin   (+ openset.ncnn.py, and openset.pt.meta.json from step 7)
+#   → openset.ncnn.param + openset.ncnn.bin   (+ openset.ncnn.py, and openset.pt.meta.json from step 8)
 ```
 
-- **Export with `--no-argmin` (step 7) for a stock ncnn wheel.** That graph is just
+- **Export with `--no-argmin` (step 8) for a stock ncnn wheel.** That graph is just
   `Normalize → matmul → subtract` and converts/runs as-is; the client does the `argmin` + reject.
   The default (in-graph argmin) export emits ops a stock wheel can't run and needs a custom layer.
 - The TorchScript route (`.pt`) usually yields a leaner ncnn graph than the ONNX route; both give the
@@ -179,7 +202,7 @@ Full ncnn client code and the custom-layer route are in [`openset.md`](openset.m
 
 ---
 
-## 9. Verify / predict
+## 10. Verify / predict
 
 ```bash
 # predict via the exported model (labels an image, or scans val/ + test/)
@@ -192,12 +215,12 @@ are accepted and `others/` items are rejected; adjust `--quantile` if needed and
 
 ---
 
-## 10. Enroll a new product later (no retraining)
+## 11. Enroll a new product later (no retraining)
 
 The ArcFace embedding generalizes, so adding a product usually needs **no retrain**:
 1. add its cutouts under `train/<newclass>/` (step 2),
 2. add its name to the class-map (step 4),
-3. rebuild/export prototypes (step 7).
+3. rebuild/export prototypes (step 8).
 
 The new class gets a prototype + threshold from a handful of images; retrain the backbone only if
 accuracy on the new class is poor.
@@ -210,11 +233,13 @@ accuracy on the new class is poor.
 # 2. video -> cutouts (per class)
 uv run python nptools/extract_object.py --video-folder <DATA>/<class>videos --dest-dir <DATA>/train/<class> --flat-out
 # 4. class map: one class per line (omit 'others')
-# 6. train ArcFace
+# 6. reduce class imbalance (symlink-oversample minority classes)
+python -m nptools.reduce_imbalance --data-dir <DATA> --split train
+# 7. train ArcFace
 sh nptools/train_posm.sh --data-dir <DATA> --class-map <DATA>/class_84.txt --new --arcface
-# 7. build + export open-set model
+# 8. build + export open-set model
 uv run python nptools/openset.py --data-dir <DATA> --class-map <DATA>/class_84.txt \
     --ck <DATA>/output/<run>/model_best.pth.tar --no-argmin --export-pt nptools/openset.pt
-# 8. convert to ncnn
+# 9. convert to ncnn
 cd nptools && pnnx openset.pt inputshape=[1,3,224,224]      # → openset.ncnn.param + .bin
 ```
