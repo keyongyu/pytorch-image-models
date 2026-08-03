@@ -75,6 +75,7 @@ def create_dataset(
         repeats: int = 0,
         input_img_mode: str = 'RGB',
         trust_remote_code: bool = False,
+        exclude_symlinks: bool = False,
         **kwargs,
 ):
     """ Dataset factory method
@@ -104,6 +105,8 @@ def create_dataset(
         repeats: Dataset repeats per iteration i.e. epoch (TFDS, WDS, HFIDS)
         input_img_mode: Input image color conversion mode e.g. 'RGB', 'L' (folder, TFDS, WDS, HFDS, HFIDS)
         trust_remote_code: Trust remote code in Hugging Face Datasets if True (HFDS, HFIDS)
+        exclude_symlinks: Skip symlinked image files when scanning folders, e.g. to drop symlinked
+            duplicates from a validation set (Folder)
         **kwargs: Other args to pass through to underlying Dataset and/or Reader classes
 
     Returns:
@@ -225,6 +228,7 @@ def create_dataset(
             class_map=class_map,
             load_bytes=load_bytes,
             input_img_mode=input_img_mode,
+            exclude_symlinks=exclude_symlinks,
             **kwargs,
         )
     return ds

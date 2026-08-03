@@ -272,9 +272,13 @@ group.add_argument('--nobg', action='store_true', default=False,
                    help='Route nobg_*.png (background-removed) samples to the npaug bg-swap '
                         'transforms; other samples use the standard transform. Forces native '
                         'input image mode so alpha/filename survive.')
-group.add_argument('--heavy-aug', action='store_true', default=False,
-                   help='Use the heavy albumentations augmentation pipeline (npaug) for all '
-                        'training images (strong lighting/shadow/blur/weather/geometric aug).')
+group.add_argument('--test-npaug-dir', type=str, default='',
+                   help='If set, DO NOT train: run a data-augmentation dry-run that dumps the '
+                        'augmented training images to this dir, grouped by class subfolder, for at '
+                        'most 4 epochs (for visually testing nptools/npaug.py).')
+group.add_argument('--test-npaug-class', type=str, default='',
+                   help='Restrict the --test-npaug-dir dry-run to these class folder(s) only '
+                        '(comma-separated); empty = all classes.')
 group.add_argument('--train-crop-mode', type=str, default=None,
                    help='Crop-mode in train'),
 group.add_argument('--crop-mode', type=str, default=None,
@@ -719,6 +723,7 @@ def main():
             target_key=args.target_key,
             num_samples=args.val_num_samples,
             trust_remote_code=args.dataset_trust_remote_code,
+            exclude_symlinks=True,  # skip symlinked duplicates when composing the validation set
         )
 
     # create data loaders w/ augmentation pipeline
@@ -858,7 +863,6 @@ def main():
             collate_fn=collate_fn,
             use_multi_epochs_loader=args.use_multi_epochs_loader,
             nobg=args.nobg,
-            heavy_aug=args.heavy_aug,
             **common_loader_kwargs,
             **train_loader_kwargs,
         )
@@ -876,6 +880,41 @@ def main():
                 _logger.info(
                     f'Scheduled loader has {len(scheduled_sampler)} batches/epoch using '
                     f'policy-average batch size {batch_size_reference:.2f}.')
+
+    if args.test_npaug_dir:
+        # Data-augmentation dry-run: no training. Just pull batches through the loader so the npaug
+        # transforms run in the workers and dump their post-aug images, grouped by class subfolder.
+        from nptools import npaug
+        # optionally restrict to specific class folder(s) so the test only augments those
+        if args.test_npaug_class:
+            wanted = {c.strip() for c in args.test_npaug_class.split(',') if c.strip()}
+            reader = getattr(dataset_train, 'reader', None)
+            if reader is None or not hasattr(reader, 'samples'):
+                raise RuntimeError('--test-npaug-class needs an image-folder dataset with a reader')
+            c2i = reader.class_to_idx
+            missing = wanted - set(c2i)
+            if missing and utils.is_primary(args):
+                _logger.warning(f'[test-npaug] class(es) not in class-map, ignored: {sorted(missing)}')
+            keep = {c2i[c] for c in wanted if c in c2i}
+            reader.samples = [s for s in reader.samples if s[1] in keep]  # loader adapts to new len
+            if not reader.samples:
+                raise RuntimeError(f'--test-npaug-class matched no images for {sorted(wanted)}')
+            if utils.is_primary(args):
+                _logger.info(f'[test-npaug] restricted to {sorted(wanted & set(c2i))}: '
+                             f'{len(reader.samples)} images')
+        npaug.set_aug_dump_dir(args.test_npaug_dir)  # set before iterating so forked workers inherit
+        n_epochs = min(4, args.epochs)               # at most 4 epochs
+        if utils.is_primary(args):
+            _logger.info(
+                f'[test-npaug] DRY-RUN (no training): dumping augmented images to '
+                f'{args.test_npaug_dir}/<class>/ for {n_epochs} epoch(s).')
+        for epoch in range(n_epochs):
+            for batch_idx, _ in enumerate(loader_train):
+                if utils.is_primary(args) and batch_idx % 50 == 0:
+                    _logger.info(f'[test-npaug] epoch {epoch} batch {batch_idx}/{len(loader_train)}')
+        if utils.is_primary(args):
+            _logger.info(f'[test-npaug] done — see {args.test_npaug_dir}')
+        return
 
     if not args.lr:
         global_batch_size = batch_size_reference * args.world_size * args.grad_accum_steps

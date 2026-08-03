@@ -9,6 +9,7 @@ def create_reader(
         name: str,
         root: Optional[str] = None,
         split: str = 'train',
+        exclude_symlinks: bool = False,
         **kwargs,
 ):
     kwargs = {k: v for k, v in kwargs.items() if v is not None}
@@ -44,5 +45,5 @@ def create_reader(
         if os.path.isfile(root) and os.path.splitext(root)[1] == '.tar':
             reader = ReaderImageInTar(root, **kwargs)
         else:
-            reader = ReaderImageFolder(root, **kwargs)
+            reader = ReaderImageFolder(root, exclude_symlinks=exclude_symlinks, **kwargs)
     return reader

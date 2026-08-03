@@ -20,7 +20,8 @@ def find_images_and_targets(
         types: Optional[Union[List, Tuple, Set]] = None,
         class_to_idx: Optional[Dict] = None,
         leaf_name_only: bool = True,
-        sort: bool = True
+        sort: bool = True,
+        exclude_symlinks: bool = False,
 ):
     """ Walk folder recursively to discover images and map them to classes by folder names.
 
@@ -30,6 +31,8 @@ def find_images_and_targets(
         class_to_idx: specify mapping for class (folder name) to class index if set
         leaf_name_only: use only leaf-name of folder walk for class names
         sort: re-sort found images by name (for consistent ordering)
+        exclude_symlinks: skip files that are symbolic links (e.g. drop symlinked duplicates
+            when composing a validation set)
 
     Returns:
         A list of image and target tuples, class_to_idx mapping
@@ -43,7 +46,10 @@ def find_images_and_targets(
         for f in files:
             base, ext = os.path.splitext(f)
             if ext.lower() in types:
-                filenames.append(os.path.join(root, f))
+                full_path = os.path.join(root, f)
+                if exclude_symlinks and os.path.islink(full_path):
+                    continue
+                filenames.append(full_path)
                 labels.append(label)
     if class_to_idx is None:
         # building class index
@@ -63,6 +69,7 @@ class ReaderImageFolder(Reader):
             root,
             class_map='',
             input_key=None,
+            exclude_symlinks=False,
     ):
         super().__init__()
 
@@ -77,6 +84,7 @@ class ReaderImageFolder(Reader):
             root,
             class_to_idx=class_to_idx,
             types=find_types,
+            exclude_symlinks=exclude_symlinks,
         )
         if len(self.samples) == 0:
             raise RuntimeError(

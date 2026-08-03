@@ -393,38 +393,6 @@ def transforms_imagenet_eval(
 
     return transforms.Compose(tfl)
 
-
-class NobgDispatchTransform:
-    """Route each image to a background-removed (nobg) transform or the standard transform.
-
-    A sample is treated as "nobg" when its source filename starts with 'nobg_' and ends with
-    '.png' (background-removed cutout). If the filename isn't available on the PIL image (e.g.
-    the loader already dropped it), it falls back to detecting an RGBA image mode.
-
-    For the filename/mode signal to survive, the dataset should load images in native mode
-    (input_img_mode=None) so nobg PNGs keep their alpha and `.filename` reaches the transform.
-    """
-
-    def __init__(self, standard_transform, nobg_transform):
-        self.standard_transform = standard_transform
-        self.nobg_transform = nobg_transform
-
-    @staticmethod
-    def _is_nobg(img) -> bool:
-        name = os.path.basename(getattr(img, 'filename', '') or '')
-        if name:
-            return name.startswith('nobg_') and name.lower().endswith('.png')
-        return getattr(img, 'mode', '') == 'RGBA'  # fallback when filename unavailable
-
-    def __call__(self, img):
-        if self._is_nobg(img):
-            return self.nobg_transform(img)
-        # standard transforms expect RGB; convert if the loader preserved a non-RGB mode
-        if getattr(img, 'mode', 'RGB') != 'RGB':
-            img = img.convert('RGB')
-        return self.standard_transform(img)
-
-
 def create_transform(
         input_size: Union[int, Tuple[int, int], Tuple[int, int, int]] = 224,
         is_training: bool = False,
@@ -459,7 +427,6 @@ def create_transform(
         patchify: bool = False,
         patchify_channels_last: bool = True,
         nobg: bool = False,
-        heavy_aug: bool = False,
 ):
     """
 
@@ -493,7 +460,7 @@ def create_transform(
         normalize: Normalization tensor output w/ provided mean/std (if prefetcher not used).
         separate: Output transforms in 3-stage tuple.
         nobg: Route nobg_*.png (background-removed) samples to the bg-swap transforms from
-            timm.data.npaug, and all other samples to the standard transform. Requires the
+            nptools.npaug, and all other samples to the standard transform. Requires the
             dataset to load images in native mode (input_img_mode=None) so the alpha channel
             and filename survive to the transform.
 
@@ -572,26 +539,11 @@ def create_transform(
                 patchify_channels_last=patchify_channels_last,
             )
 
-    if heavy_aug and is_training and not no_aug and not tf_preprocessing:
-        # replace the training transform with the heavy albumentations pipeline (applied to all images)
-        assert not separate, "heavy_aug not supported with separate transforms"
-        assert not naflex, "heavy_aug not supported with naflex"
-        from timm.data.npaug import transform_heavy_train
-        transform = transform_heavy_train(
-            img_size,
-            train_crop_mode=train_crop_mode,
-            mean=mean,
-            std=std,
-            interpolation=interpolation,
-            use_prefetcher=use_prefetcher,
-            normalize=normalize,
-        )
-
     if nobg:
         # route nobg_*.png (background-removed) samples to the bg-swap transforms, others to standard
         assert not separate, "nobg dispatch not supported with separate transforms"
         assert not naflex, "nobg dispatch not supported with naflex"
-        from timm.data.npaug import transform_nobg_train, transform_nobg_eval
+        from nptools.npaug import transform_nobg_train, transform_nobg_eval
         if is_training and not no_aug:
             nobg_transform = transform_nobg_train(
                 img_size,
@@ -613,6 +565,8 @@ def create_transform(
                 use_prefetcher=use_prefetcher,
                 normalize=normalize,
             )
-        transform = NobgDispatchTransform(transform, nobg_transform)
+        # nobg transforms now handle both RGBA cutouts and RGB photos internally, so route
+        # every sample through them (the standard `transform` built above is discarded).
+        transform = nobg_transform
 
     return transform

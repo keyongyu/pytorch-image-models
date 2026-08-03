@@ -4,6 +4,7 @@ Hacked together by / Copyright 2019, Ross Wightman
 """
 import io
 import logging
+import os
 from typing import Optional
 
 import torch
@@ -54,7 +55,17 @@ class ImageDataset(data.Dataset):
         for attempt in range(self._max_retries):
             try:
                 img, target, *features = self.reader[index]
-                img = img.read() if self.load_bytes else Image.open(img)
+                if self.load_bytes:
+                    img = img.read()
+                else:
+                    fh = img
+                    img = Image.open(fh)
+                    # PIL leaves .filename empty for file-handle inputs; propagate the handle's
+                    # path so downstream transforms can recover the sample's class (parent dir)
+                    # and detect nobg_ cutouts. Survives when input_img_mode is None (no convert).
+                    # Resolve symlinks to the real target path so the resolved name is used.
+                    fh_name = getattr(fh, 'name', '') or ''
+                    img.filename = os.path.realpath(fh_name) if fh_name else ''
                 break
             except (IOError, OSError) as e:  # be specific
                 _logger.warning(f'Skipped sample (index {index}). {e}')
@@ -63,7 +74,9 @@ class ImageDataset(data.Dataset):
             raise RuntimeError(f"Failed to load {self._max_retries} consecutive samples")
 
         if self.input_img_mode and not self.load_bytes:
-            img = img.convert(self.input_img_mode)
+            filename = getattr(img, 'filename', '')
+            img = img.convert(self.input_img_mode)  # .convert() returns a new image, dropping .filename
+            img.filename = filename
         if self.transform is not None:
             img = self.transform(img)
 

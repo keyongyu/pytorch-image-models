@@ -17,7 +17,7 @@ How it works here (feature-prototype / metric approach):
 ```
       ┌──────────── build once, from training data (classes from class-map) ─────┐
       │  for each class: mean of its pre-logits features → prototype (L2-norm)   │
-      │  PER-CLASS threshold[c] = 95th percentile of THAT class's own distances  │
+      │  PER-CLASS threshold[c] = --quantile of its own distances (default 0.97) │
       └──────────────────────────────────────────────────────────────────────────┘
 
   image ─► backbone ─► pre-logits feature (1280-d) ─► L2 normalize
@@ -54,9 +54,12 @@ class-map defines which classes to use, in what order, and — via its line coun
 | arg | required | meaning |
 |---|---|---|
 | `--class-map PATH` | **yes** (PyTorch/export path) | class-map file, one class name per line. Its **line count = `num_classes`**, and its **order = class index order**. Not needed for `--load-onnx`. |
-| `--checkpoint PATH` | **yes** (PyTorch/export path) | the trained checkpoint to load |
+| `--checkpoint PATH` / `--ck` | **yes** (PyTorch/export path) | the trained checkpoint to load (`--ck` is a short alias) |
 | `--data-dir DIR` | no (default posmlv) | dataset root with `train/`, `val/`, `test/` subfolders |
 | `--img-size N` | no (default 224) | square input size |
+| `--quantile Q` | no (default 0.97) | per-class reject threshold = this quantile of the class's in-distribution cosine distances (higher ⇒ fewer knowns rejected, more unknowns accepted) |
+| `--aug` / `--no-aug` | no (default `--aug`) | calibrate thresholds from **npaug-augmented** distances (prototype stays clean), widening the spread to real-world variation; `--no-aug` uses clean distances |
+| `--aug-views N` | no (default 2) | number of augmented passes over train used for threshold calibration |
 | `--export-onnx [PATH]` | no | export ONNX (+ `<PATH>.meta.json`); default `<checkpoint>_openset.onnx` |
 | `--export-pt [PATH]` | no | export TorchScript (+ `<PATH>.meta.json`); default `<checkpoint>_openset.pt` |
 | `--image PATH` | no | classify a single image (else scans `val/` + `test/`) |
@@ -83,8 +86,12 @@ Notes:
   a class with **< 10 images** is warned (prototype/threshold may be unreliable) but still used.
   Folders **not** in the class-map are ignored. So the exported model may have **fewer** classes
   than the class-map (skipped ones); `meta.json` records the exact final list.
-- **Per-class thresholds** are computed automatically (95th percentile of each class's own
-  distances) — there is no single scalar override; each class is judged against its own spread.
+- **Per-class thresholds** are computed automatically — the `--quantile` (default 0.97) of each
+  class's own distance spread; there is no single global value, each class is judged against its own
+  spread. With `--aug` (default on) those distances come from **npaug-augmented** views (the
+  prototype is still built from clean images), so the threshold reflects real-world variation rather
+  than the optimistic clean-train spread; `--no-aug` uses clean distances. Only class-map folders are
+  read, so `others`/unknown is never augmented.
 - Prototype building is **parallelized** (DataLoader workers + batched GPU inference) and prints
   its **elapsed time**.
 - **Prediction source:** with `--image` it's that one image; otherwise it scans **both** `val/`

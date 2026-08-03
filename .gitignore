@@ -132,3 +132,6 @@ Testing notebook.ipynb
 nptools/model_openset.*
 nptools/weights/
 .zed/
+nptools/confuse/
+nptools/confuse.x/
+nptmp/posm_18/

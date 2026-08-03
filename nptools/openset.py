@@ -64,6 +64,25 @@ def build_transform(img_size: int) -> transforms.Compose:
     ])
 
 
+class _NpAugTransform:
+    """npaug (build_aug_pipeline) augmentation -> normalized tensor, for threshold calibration.
+
+    Used only to widen the in-distribution distance spread so per-class reject thresholds reflect
+    real-world variation (lighting/blur/geometry) instead of the optimistic clean-train spread.
+    The prototype itself is still built from clean images.
+    """
+
+    def __init__(self, img_size: int):
+        from nptools.npaug import build_aug_pipeline
+        self.aug = build_aug_pipeline(img_size=img_size)     # ends with Resize -> (img_size, img_size)
+        self.norm = transforms.Normalize(mean=MEAN, std=STD)
+
+    def __call__(self, pil_rgb):
+        out = self.aug(image=np.array(pil_rgb))['image']     # HWC uint8 RGB
+        t = torch.from_numpy(np.ascontiguousarray(out)).permute(2, 0, 1).float().div_(255.0)
+        return self.norm(t)
+
+
 @torch.no_grad()
 def extract_feature(model: torch.nn.Module, transform, img_path: str, device: str) -> torch.Tensor:
     img = Image.open(img_path).convert('RGB')
@@ -101,7 +120,7 @@ class _FeatDataset(torch.utils.data.Dataset):
 
 def build_prototypes(model, transform, device: str, data_dir: str, img_size: int,
                      class_map_names, batch_size: int = 64, num_workers: int = 8,
-                     threshold_quantile: float = 0.95):
+                     threshold_quantile: float = 0.97, aug: bool = True, aug_views: int = 2):
     """Compute an L2-normalized mean feature per class from the training split.
 
     Only the classes listed in `class_map_names` are used, in that order (folders not in the
@@ -134,33 +153,49 @@ def build_prototypes(model, transform, device: str, data_dir: str, img_size: int
     if not class_names:
         raise RuntimeError(f'No class-map class had images under {train_root}')
 
-    loader = torch.utils.data.DataLoader(
-        _FeatDataset(samples, transform, img_size),
-        batch_size=batch_size,
-        num_workers=num_workers,
-        pin_memory=(str(device) != 'cpu'),
-    )
-
-    # batched feature extraction, grouped by class
-    feats_by_class = [[] for _ in class_names]
     model.eval()
-    with torch.inference_mode():
-        for x, cls in loader:
-            x = x.to(device, non_blocking=True)
-            f = model.forward_head(model.forward_features(x), pre_logits=True)  # [B, 1280]
-            f = F.normalize(f, dim=1).cpu()
-            for fi, ci in zip(f, cls.tolist()):
-                if ci >= 0:                                   # skip unreadable (ci == -1)
-                    feats_by_class[ci].append(fi)
+
+    def _extract(tf):
+        """Feature-extract all samples with transform `tf`, grouped by class index."""
+        loader = torch.utils.data.DataLoader(
+            _FeatDataset(samples, tf, img_size),
+            batch_size=batch_size, num_workers=num_workers,
+            pin_memory=(str(device) != 'cpu'),
+        )
+        fbc = [[] for _ in class_names]
+        with torch.inference_mode():
+            for x, cls in loader:
+                x = x.to(device, non_blocking=True)
+                f = model.forward_head(model.forward_features(x), pre_logits=True)  # [B, 1280]
+                f = F.normalize(f, dim=1).cpu()
+                for fi, ci in zip(f, cls.tolist()):
+                    if ci >= 0:                               # skip unreadable (ci == -1)
+                        fbc[ci].append(fi)
+        return fbc
+
+    # PROTOTYPE from clean images (matches inference preprocessing; keep it on the clean manifold).
+    feats_by_class = _extract(transform)
+
+    # THRESHOLD distances: from npaug-augmented views (widens the spread to real-world variation)
+    # when aug is on; otherwise from the same clean features.
+    if aug:
+        aug_tf = _NpAugTransform(img_size)
+        thr_feats_by_class = [[] for _ in class_names]
+        for _ in range(max(1, aug_views)):
+            for i, fl in enumerate(_extract(aug_tf)):
+                thr_feats_by_class[i] += fl
+    else:
+        thr_feats_by_class = feats_by_class
 
     prototypes, thresholds = {}, {}
     for i, cls in enumerate(class_names):
         if not feats_by_class[i]:
             continue
-        feats = torch.stack(feats_by_class[i])               # [N, 1280]
+        feats = torch.stack(feats_by_class[i])               # [N, 1280] clean
         proto = F.normalize(feats.mean(dim=0), dim=0)        # normalized class mean
         prototypes[cls] = proto
-        dists = 1.0 - (feats @ proto)                        # in-distribution cosine distances
+        thr_feats = torch.stack(thr_feats_by_class[i]) if thr_feats_by_class[i] else feats
+        dists = 1.0 - (thr_feats @ proto)                    # distances used for the threshold
         # PER-CLASS threshold: this class's own distance spread, not a single global value
         # (a global threshold is dominated by diffuse catch-all classes like 'others').
         thr = float(torch.quantile(dists, threshold_quantile))
@@ -421,7 +456,7 @@ def main():
     parser.add_argument('--class-map', default='', type=str,
                         help='class-map file (one class name per line); its line count sets '
                              'num_classes. Required for the PyTorch/export path (not for --load-onnx).')
-    parser.add_argument('--checkpoint', default='', type=str)
+    parser.add_argument('--ck', '--checkpoint', dest='checkpoint', default='', type=str)
     parser.add_argument('--image', default='', type=str, help='single image to classify (open-set)')
     parser.add_argument(
         '--export-onnx', nargs='?', const='', default=None, metavar='PATH',
@@ -443,6 +478,15 @@ def main():
              'vectors (no argmax/gather in the graph) and the argmin + reject move to the client. '
              'Converts/runs on a stock ncnn wheel. Default keeps the in-graph argmin scalar outputs.',
     )
+    parser.add_argument(
+        '--quantile', default=0.97, type=float, metavar='Q',
+        help='reject threshold quantile (default: 0.97)',
+    )
+    parser.add_argument(
+        '--aug', action=argparse.BooleanOptionalAction, default=True,
+        help='use npaug augmentation to calibrate thresholds (prototype stays clean); --no-aug to disable',
+    )
+    parser.add_argument('--aug-views', default=2, type=int, help='augmented passes for thresholds (default: 2)')
     args = parser.parse_args()
 
     transform = build_transform(args.img_size)
@@ -491,8 +535,10 @@ def main():
 
     print('Building class prototypes from training set...')
     prototypes, class_names, thresholds = build_prototypes(
-        model, transform, device, args.data_dir, args.img_size, class_map_names)
-    print(f'\nPer-class thresholds computed ({len(class_names)} classes)\n')
+        model, transform, device, args.data_dir, args.img_size, class_map_names,
+        threshold_quantile=args.quantile, aug=args.aug, aug_views=args.aug_views)
+    print(f'\nPer-class thresholds computed ({len(class_names)} classes, quantile={args.quantile}, '
+          f'aug={args.aug})\n')
 
     onnx_path = pt_path = None
     if args.export_onnx is not None:

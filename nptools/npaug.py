@@ -13,13 +13,19 @@ import torch
 from PIL import Image as PILImage
 from typing import Optional, Tuple, Union
 
+# This module is imported inside every DataLoader worker. By default OpenCV spins up a
+# thread pool sized to the CPU count (32 here), so N workers => N*32 threads fighting for
+# the cores and adding scheduling overhead with no real speedup on small (224px) images.
+# Pin OpenCV to a single thread per worker so parallelism comes from `--workers` instead.
+cv2.setNumThreads(1)
+
 try:
     from timm.data.constants import IMAGENET_DEFAULT_MEAN, IMAGENET_DEFAULT_STD
 except Exception:
     IMAGENET_DEFAULT_MEAN = (0.485, 0.456, 0.406)
     IMAGENET_DEFAULT_STD = (0.229, 0.224, 0.225)
 
-# ── Global augmentation switch for the nobg / heavy-aug train transforms ─────────
+# ── Global augmentation switch for the nobg train transforms ─────────────────────
 #   True  -> build_aug_pipeline        (heavy geometric + photometric; DISTORTS shape/aspect)
 #   False -> build_photometric_pipeline (photometric only; shape/aspect PRESERVED)
 # Edit this default, or override via env: NOBG_FULL_AUG=1 (on) / 0 (off).
@@ -33,16 +39,37 @@ _AUG_DUMP_MAX = int(os.environ.get('AUG_DUMP_MAX', '200'))
 _aug_dump_count = 0
 
 
-def _maybe_dump(np_rgb):
-    """If AUG_DUMP_DIR is set, save the augmented HWC uint8 RGB image with an incrementing name."""
+def set_aug_dump_dir(path, max_per_worker=None):
+    """Enable (or disable) dumping post-augmentation images for visual npaug testing.
+
+    When `path` is set, each augmented image is saved under ``<path>/<class>/`` (class taken from
+    the sample's filename parent folder). Call this in the MAIN process before iterating the loader
+    so forked DataLoader workers inherit the setting. `max_per_worker` caps saves per worker.
+    """
+    global _AUG_DUMP_DIR, _AUG_DUMP_MAX, _aug_dump_count
+    _AUG_DUMP_DIR = path or None
+    if max_per_worker is not None:
+        _AUG_DUMP_MAX = int(max_per_worker)
+    _aug_dump_count = 0
+
+
+def _maybe_dump(np_rgb, subdir=None):
+    """If dumping is enabled, save the augmented HWC uint8 RGB image (grouped into `subdir`)."""
     global _aug_dump_count
     if _AUG_DUMP_DIR is None or _aug_dump_count >= _AUG_DUMP_MAX:
         return
-    os.makedirs(_AUG_DUMP_DIR, exist_ok=True)
+    out_dir = _AUG_DUMP_DIR if not subdir else os.path.join(_AUG_DUMP_DIR, subdir)
+    os.makedirs(out_dir, exist_ok=True)
     idx = _aug_dump_count
     _aug_dump_count += 1
     # pid prefix avoids collisions across DataLoader worker processes
-    PILImage.fromarray(np_rgb).save(os.path.join(_AUG_DUMP_DIR, f'{os.getpid()}_{idx:06d}.png'))
+    PILImage.fromarray(np_rgb).save(os.path.join(out_dir, f'{os.getpid()}_{idx:06d}.png'))
+
+
+def _class_of(pil_img):
+    """Class name for dump grouping = parent folder of the sample's filename (or 'unknown')."""
+    fn = getattr(pil_img, 'filename', '') or ''
+    return os.path.basename(os.path.dirname(fn)) or 'unknown'
 
 
 class RandomSpotlight(A.ImageOnlyTransform):
@@ -471,9 +498,9 @@ def _composite_rgba(fg_rgba, bg_rgb):
     return (fg_rgb * alpha + bg_rgb * (1.0 - alpha)).astype(np.uint8)
 
 
-def _finalize_tensor(np_rgb, mean, std, normalize, use_prefetcher):
+def _finalize_tensor(np_rgb, mean, std, normalize, use_prefetcher, dump_subdir=None):
     """HWC uint8 RGB -> CHW tensor; normalized float unless prefetcher / normalize=False (uint8)."""
-    _maybe_dump(np_rgb)  # optional debug dump of the post-augmentation image
+    _maybe_dump(np_rgb, dump_subdir)  # optional debug dump of the post-augmentation image
     t = torch.from_numpy(np.ascontiguousarray(np_rgb)).permute(2, 0, 1).contiguous()
     if use_prefetcher or not normalize:
         return t  # uint8; prefetcher scales & normalizes on device
@@ -506,10 +533,12 @@ def _fit_rgb(rgb, h, w, squash, fill):
 
 
 class _NoBgTrainTransform:
-    """bg-swap: fit the cutout to the target (h,w) box, composite onto a random background of the
-    same box, then apply the full augmentation pipeline (build_aug_pipeline: heavy geometric +
-    photometric). Note build_aug_pipeline does its own square resize/crop, so it distorts aspect
-    (not shape-preserving); the `squash` fit only controls the composite placement.
+    """Fit the input to the target (h,w) box, then apply the full augmentation pipeline
+    (build_aug_pipeline: heavy geometric + photometric). Handles both:
+      - RGBA cutouts (background-removed PNGs) -> composite onto a random background (bg-swap);
+      - RGB photos -> fit only (no composite), so the whole dataset shares this albumentations path.
+    Note build_aug_pipeline does its own square resize/crop, so it distorts aspect (not
+    shape-preserving); the `squash` fit only controls the initial placement.
     """
 
     def __init__(self, img_size, mean, std, normalize, use_prefetcher, squash=False, fill=(255, 255, 255)):
@@ -522,15 +551,29 @@ class _NoBgTrainTransform:
         self.normalize, self.use_prefetcher = normalize, use_prefetcher
         self.fill = tuple(fill)  # RGB
 
+    @staticmethod
+    def _is_nobg(img) -> bool:
+        name = os.path.basename(getattr(img, 'filename', '') or '')
+        if name:
+            return name.startswith('nobg_') and name.lower().endswith('.png')
+        return getattr(img, 'mode', '') == 'RGBA'  # fallback when filename unavailable
+
     def __call__(self, pil_img):
-        fg = _fit_rgba(np.array(pil_img.convert('RGBA')), self.h, self.w, self.squash)  # (h,w,4)
-        alpha = fg[:, :, 3:4].astype(np.float32) / 255.0
-        bg = _bg_rect_rgb(_NOBG_BG_PATHS, self.h, self.w, self.fill)             # (h,w,3) real bg
-        comp = (fg[:, :, :3].astype(np.float32) * alpha + bg * (1.0 - alpha)).astype(np.uint8)
+        #if pil_img.mode == 'RGBA':
+        if self._is_nobg(pil_img):
+            # background-removed cutout: composite onto a random background (bg-swap)
+            fg = _fit_rgba(np.array(pil_img.convert('RGBA')), self.h, self.w, self.squash)  # (h,w,4)
+            alpha = fg[:, :, 3:4].astype(np.float32) / 255.0
+            bg = _bg_rect_rgb(_NOBG_BG_PATHS, self.h, self.w, self.fill)             # (h,w,3) real bg
+            comp = (fg[:, :, :3].astype(np.float32) * alpha + bg * (1.0 - alpha)).astype(np.uint8)
+        else:
+            # plain RGB photo: fit to the box, no composite
+            comp = _fit_rgb(np.array(pil_img.convert('RGB')), self.h, self.w, self.squash, self.fill)
         out = self.aug(image=comp)['image']
         if self.full_aug:
             out = _resize_rgb(out, self.h, self.w)     # build_aug_pipeline outputs square -> (h,w)
-        return _finalize_tensor(out, self.mean, self.std, self.normalize, self.use_prefetcher)
+        return _finalize_tensor(out, self.mean, self.std, self.normalize, self.use_prefetcher,
+                                dump_subdir=_class_of(pil_img))
 
 
 class _NoBgEvalTransform:
@@ -542,74 +585,18 @@ class _NoBgEvalTransform:
         self.fill = tuple(fill)  # RGB
 
     def __call__(self, pil_img):
-        # deterministic: fit cutout to (h,w) per crop mode, composite onto solid fill
-        fg = _fit_rgba(np.array(pil_img.convert('RGBA')), self.h, self.w, self.squash)
-        alpha = fg[:, :, 3:4].astype(np.float32) / 255.0
-        bg = np.full((self.h, self.w, 3), self.fill, dtype=np.uint8)
-        comp = (fg[:, :, :3].astype(np.float32) * alpha + bg * (1.0 - alpha)).astype(np.uint8)
-        return _finalize_tensor(comp, self.mean, self.std, self.normalize, self.use_prefetcher)
-
-
-class _HeavyAugTrainTransform:
-    """Heavy photometric augmentation for RGB images (no bg-swap / alpha needed).
-
-    crop mode:
-      squash=False (border) -> letterbox, aspect/silhouette preserved (for shape-based classes)
-      squash=True           -> stretch to fill the box (aspect discarded)
-    """
-
-    def __init__(self, img_size, mean, std, normalize, use_prefetcher, squash=False, fill=(255, 255, 255)):
-        self.h, self.w = _as_size(img_size)
-        self.squash = squash
-        self.fill = tuple(fill)
-        self.photo = build_photometric_pipeline()
-        self.mean, self.std = mean, std
-        self.normalize, self.use_prefetcher = normalize, use_prefetcher
-
-    def __call__(self, pil_img):
-        rgb = np.array(pil_img.convert('RGB'))
-        rgb = _fit_rgb(rgb, self.h, self.w, self.squash, self.fill)
-        out = self.photo(image=rgb)['image']                  # photometric only
-        return _finalize_tensor(out, self.mean, self.std, self.normalize, self.use_prefetcher)
-
-#used for normal image for heavy augmentations by transform_factory
-def transform_heavy_train(
-        img_size: Union[int, Tuple[int, int]] = 224,
-        scale: Optional[Tuple[float, float]] = None,
-        ratio: Optional[Tuple[float, float]] = None,
-        train_crop_mode: Optional[str] = None,
-        hflip: float = 0.5,
-        vflip: float = 0.,
-        color_jitter: Union[float, Tuple[float, ...]] = 0.4,
-        color_jitter_prob: Optional[float] = None,
-        force_color_jitter: bool = False,
-        grayscale_prob: float = 0.,
-        gaussian_blur_prob: float = 0.,
-        auto_augment: Optional[str] = None,
-        interpolation: str = 'random',
-        mean: Tuple[float, ...] = IMAGENET_DEFAULT_MEAN,
-        std: Tuple[float, ...] = IMAGENET_DEFAULT_STD,
-        re_prob: float = 0.,
-        re_mode: str = 'const',
-        re_count: int = 1,
-        re_num_splits: int = 0,
-        use_prefetcher: bool = False,
-        normalize: bool = True,
-        separate: bool = False,
-        naflex: bool = False,
-        patch_size: Union[int, Tuple[int, int]] = 16,
-        max_seq_len: int = 576,
-        patchify: bool = False,
-        patchify_channels_last: bool = True,
-):
-    """Heavy-augmentation training transform for regular RGB images (albumentations pipeline).
-
-    Signature mirrors transforms_imagenet_train for drop-in use; imagenet-style aug kwargs are
-    accepted but ignored (the albumentations pipeline governs augmentation). `train_crop_mode`
-    selects fit: 'squash' stretches to the box, anything else letterboxes (aspect preserved).
-    """
-    return _HeavyAugTrainTransform(
-        img_size, mean, std, normalize, use_prefetcher, squash=(train_crop_mode == 'squash'))
+        # deterministic: fit input to (h,w) per crop mode (eval never augments)
+        if pil_img.mode == 'RGBA':
+            # cutout: composite onto solid fill
+            fg = _fit_rgba(np.array(pil_img.convert('RGBA')), self.h, self.w, self.squash)
+            alpha = fg[:, :, 3:4].astype(np.float32) / 255.0
+            bg = np.full((self.h, self.w, 3), self.fill, dtype=np.uint8)
+            comp = (fg[:, :, :3].astype(np.float32) * alpha + bg * (1.0 - alpha)).astype(np.uint8)
+        else:
+            # plain RGB photo: fit to the box, no composite
+            comp = _fit_rgb(np.array(pil_img.convert('RGB')), self.h, self.w, self.squash, self.fill)
+        return _finalize_tensor(comp, self.mean, self.std, self.normalize, self.use_prefetcher,
+                                dump_subdir=_class_of(pil_img))
 
 
 def transform_nobg_train(

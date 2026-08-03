@@ -42,20 +42,20 @@ class ArcFaceLoss(nn.Module):
 
     Math / geometry (why this beats plain linear-softmax for open-set):
         Plain softmax uses the raw dot product as the logit:
-            logit_j = W_j . x = ||W_j|| * ||x|| * cos(theta_j)
+            logit_j = W_j . x = ||W_j|| * ||x|| * cos(θ)
         It separates the training classes but does not control the geometry, so same-class
         embeddings can be spread out and different classes can sit close together -- bad when the
         decision rule at test time is cosine distance to a gallery.
 
         ArcFace strips everything except the ANGLE and enforces a margin around it:
-          1. L2-normalize x and every W_j  => ||x||=||W_j||=1, so logit_j = cos(theta_j). Magnitude
+          1. L2-normalize x and every W_j  => ||x||=||W_j||=1, so logit_j = cos(θ_j). Magnitude
              is gone; each W_j is a learned prototype on the unit hypersphere and classification is
              "which prototype is my embedding closest to in angle".
           2. Add an angular margin m to the GROUND-TRUTH class only, before scaling by s:
-                 target class : s * cos(theta_y + m)     # penalized -- looks worse on purpose
-                 other classes: s * cos(theta_j)          # unchanged
-             Since cos is decreasing, cos(theta_y + m) < cos(theta_y): the correct class is made to
-             look worse during training, so to drive the loss down the network must pull theta_y
+                 target class : s * cos(θ_y + m)     # penalized -- looks worse on purpose
+                 other classes: s * cos(θ_j)          # unchanged
+             Since cos is decreasing, cos(θ_y + m) < cos(θ_y): the correct class is made to
+             look worse during training, so to drive the loss down the network must pull θ_y
              even smaller -- clustering same-class embeddings tighter and opening a gap of size m to
              other classes. The margin lives in ANGLE space (additive), which is what makes ArcFace
              cleaner than CosFace (additive cosine margin) or SphereFace (multiplicative).
@@ -96,30 +96,30 @@ class ArcFaceLoss(nn.Module):
         self.base_criterion = base_criterion if base_criterion is not None else nn.CrossEntropyLoss()
 
         # Precompute margin constants from the fixed m so the forward pass never calls arccos/cos.
-        # _cos_m / _sin_m feed the angle-addition identity cos(theta + m) = cos.cos_m - sin.sin_m.
+        # _cos_m / _sin_m feed the angle-addition identity cos(θ + m) = cos.cos_m - sin.sin_m.
         # _th / _mm are the "easy margin" monotonicity guard (see _margin_logits).
         self._cos_m = math.cos(m)
         self._sin_m = math.sin(m)
-        self._th = math.cos(math.pi - m)          # cos(theta) below this => theta + m > pi
+        self._th = math.cos(math.pi - m)          # cos(θ) below this => θ + m > pi
         self._mm = math.sin(math.pi - m) * m      # linear fallback keeps the target logit monotone
 
     def logits(self, features: torch.Tensor) -> torch.Tensor:
         """Plain scaled cosine logits (no margin) — used for eval / accuracy.
 
         Accuracy is measured on the UN-penalized cosines: the margin is a training-time trick, not
-        the real decision rule, so metrics use s*cos(theta) directly.
+        the real decision rule, so metrics use s*cos(θ) directly.
         """
-        # F.normalize -> unit vectors; F.linear(a, b) = a @ b.T -> cos(theta) for every sample x class.
+        # F.normalize -> unit vectors; F.linear(a, b) = a @ b.T -> cos(θ) for every sample x class.
         cosine = F.linear(F.normalize(features), F.normalize(self.weight))
         return cosine * self.s
 
     def _margin_logits(self, cosine: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
-        # sin(theta) from cos(theta) via the Pythagorean identity; clamp guards sqrt against fp noise.
+        # sin(θ) from cos(θ) via the Pythagorean identity; clamp guards sqrt against fp noise.
         sine = torch.sqrt((1.0 - cosine.pow(2)).clamp_(0.0, 1.0))
-        # Angle-addition identity: the penalized target logit cos(theta + m), no arccos needed.
-        phi = cosine * self._cos_m - sine * self._sin_m                  # cos(theta + m)
-        # Monotonicity guard: cos(theta + m) is only a valid (decreasing) penalty while theta + m <= pi.
-        # Once theta is so large that theta + m overshoots pi, cos starts rising again and would reward
+        # Angle-addition identity: the penalized target logit cos(θ + m), no arccos needed.
+        phi = cosine * self._cos_m - sine * self._sin_m                  # cos(θ + m)
+        # Monotonicity guard: cos(θ + m) is only a valid (decreasing) penalty while θ + m <= pi.
+        # Once θ is so large that θ + m overshoots pi, cos starts rising again and would reward
         # being wrong; below the threshold _th we swap in a linear fallback that stays monotonic. Mostly
         # fires only early in training when features are still near-random.
         phi = torch.where(cosine > self._th, phi, cosine - self._mm)     # keep monotonic near pi
@@ -133,7 +133,7 @@ class ArcFaceLoss(nn.Module):
         Hard integer labels get the angular margin; soft / mixup targets (float, or 2-D one-hot)
         fall back to plain scaled cosine (the margin needs a single ground-truth class index).
         """
-        # cos(theta) between unit-normalized embeddings and unit-normalized class prototypes.
+        # cos(θ) between unit-normalized embeddings and unit-normalized class prototypes.
         cosine = F.linear(F.normalize(features), F.normalize(self.weight))
         # The additive angular margin needs a single ground-truth index (the one-hot mask), so it only
         # applies to hard integer labels. Soft / mixup targets (float or 2-D one-hot) have no single
@@ -175,6 +175,14 @@ class ArcFaceTask(TrainingTask):
         super().__init__(device=device, dtype=dtype, verbose=verbose)
         self.trainable_module = model
         self.criterion = criterion  # ArcFaceLoss owns the head weight (training-only)
+
+        # Announce on stdout so it is obvious ArcFace is active for this run (logging config
+        # may route _logger elsewhere or be silenced).
+        print(
+            f">>> ArcFace loss IN USE: in_features={criterion.in_features} "
+            f"num_classes={criterion.num_classes} s={criterion.s} m={criterion.m}",
+            flush=True,
+        )
 
         if self.verbose:
             _logger.info(
