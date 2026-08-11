@@ -101,6 +101,44 @@ class RandomSpotlight(A.ImageOnlyTransform):
         return ("intensity_range",)
 
 
+class BottomBiggerPerspective(A.Perspective):
+    """Squeeze the top edge inward so the bottom appears wider (camera-above look).
+
+    Maps full image corners → trapezoid with narrowed top; warpPerspective fills
+    the vacated top corners with the border mode instead of zooming in.
+    """
+
+    def get_params_dependent_on_data(self, params, data):
+        h, w = params["shape"][:2]
+        scale = self.py_random.uniform(*self.scale)
+        dx = int(w * scale)
+        src = np.float32([[0, 0],  [w-1, 0],    [w-1, h-1], [0, h-1]])
+        dst = np.float32([[dx, 0], [w-1-dx, 0], [w-1, h-1], [0, h-1]])
+        matrix = cv2.getPerspectiveTransform(src, dst)
+        return {"matrix": matrix, "max_height": h, "max_width": w, "matrix_bbox": matrix}
+
+
+class TopBiggerPerspective(A.Perspective):
+    """Squeeze the bottom edge inward so the top appears wider (camera-below look)."""
+
+    def get_params_dependent_on_data(self, params, data):
+        h, w = params["shape"][:2]
+        scale = self.py_random.uniform(*self.scale)
+        dx = int(w * scale)
+        src = np.float32([[0, 0], [w-1, 0], [w-1, h-1],    [0, h-1]])
+        dst = np.float32([[0, 0], [w-1, 0], [w-1-dx, h-1], [dx, h-1]])
+        matrix = cv2.getPerspectiveTransform(src, dst)
+        return {"matrix": matrix, "max_height": h, "max_width": w, "matrix_bbox": matrix}
+
+
+def make_bottom_top_perspective_transform(scale=(0.02, 0.15)):
+    """Random directional perspective: 25% bottom-bigger, 25% top-bigger, 50% unchanged."""
+    return A.OneOf([
+        BottomBiggerPerspective(scale=scale, p=1.0),
+        TopBiggerPerspective(scale=scale, p=1.0),
+    ], p=0.5)
+
+
 # ── Pipeline builder ──────────────────────────────────────────────────────────
 
 
@@ -120,7 +158,7 @@ def build_aug_pipeline(img_size=224):
         # A.HorizontalFlip(p=0.5),
         A.OneOf(
             [
-                A.Rotate(limit=25, border_mode=cv2.BORDER_REFLECT_101),
+                A.Rotate(limit=20, border_mode=cv2.BORDER_REFLECT_101),
                 A.Affine(
                     scale=(0.75, 1.25),
                     translate_percent={"x": (-0.12, 0.12), "y": (-0.12, 0.12)},
@@ -548,6 +586,7 @@ class _NoBgTrainTransform:
         self.full_aug = USE_FULL_AUG
         self.aug = build_aug_pipeline(img_size=min(self.h, self.w)) if self.full_aug \
             else build_photometric_pipeline()
+        self.persp = make_bottom_top_perspective_transform()
         self.mean, self.std = mean, std
         self.normalize, self.use_prefetcher = normalize, use_prefetcher
         self.fill = tuple(fill)  # RGB
@@ -563,7 +602,8 @@ class _NoBgTrainTransform:
         #if pil_img.mode == 'RGBA':
         if self._is_nobg(pil_img):
             # background-removed cutout: composite onto a random background (bg-swap)
-            fg = _fit_rgba(np.array(pil_img.convert('RGBA')), self.h, self.w, self.squash)  # (h,w,4)
+            fg = self.persp(image=np.array(pil_img.convert('RGBA')))['image']
+            fg = _fit_rgba(fg, self.h, self.w, self.squash)  # (h,w,4)
             alpha = fg[:, :, 3:4].astype(np.float32) / 255.0
             bg = _bg_rect_rgb(_NOBG_BG_PATHS, self.h, self.w, self.fill)             # (h,w,3) real bg
             comp = (fg[:, :, :3].astype(np.float32) * alpha + bg * (1.0 - alpha)).astype(np.uint8)
