@@ -6,6 +6,8 @@ threshold is rejected as 'unknown'.
 """
 import os
 import glob
+import shutil
+from pathlib import Path
 import time
 import argparse
 
@@ -64,6 +66,14 @@ def build_transform(img_size: int) -> transforms.Compose:
     ])
 
 
+def _build_raw_transform(img_size: int) -> transforms.Compose:
+    """Resize + ToTensor only (no normalize) — used for the GPU aug pass."""
+    return transforms.Compose([
+        transforms.Resize((img_size, img_size), interpolation=transforms.InterpolationMode.BICUBIC),
+        transforms.ToTensor(),
+    ])
+
+
 class _NpAugTransform:
     """npaug (build_aug_pipeline) augmentation -> normalized tensor, for threshold calibration.
 
@@ -81,6 +91,29 @@ class _NpAugTransform:
         out = self.aug(image=np.array(pil_rgb))['image']     # HWC uint8 RGB
         t = torch.from_numpy(np.ascontiguousarray(out)).permute(2, 0, 1).float().div_(255.0)
         return self.norm(t)
+
+
+class _GpuAugBatch(torch.nn.Module):
+    """Batch augmentation on GPU for threshold calibration.
+
+    Input:  [B, 3, H, W] float in [0, 1] on the target device.
+    Output: [B, 3, H, W] augmented + normalized, ready for the backbone.
+
+    Workers only decode+resize (fast), all heavy augmentation runs on GPU.
+    """
+
+    def __init__(self, img_size: int):
+        super().__init__()
+        from torchvision.transforms import v2
+        self.aug = v2.Compose([
+            v2.RandomPerspective(distortion_scale=0.2, p=0.5),
+            v2.ColorJitter(brightness=0.4, contrast=0.3, saturation=0.3, hue=0.05),
+            v2.GaussianBlur(kernel_size=5, sigma=(0.1, 2.0)),
+        ])
+        self.norm = transforms.Normalize(mean=MEAN, std=STD)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.norm(self.aug(x))
 
 
 @torch.no_grad()
@@ -118,9 +151,18 @@ class _FeatDataset(torch.utils.data.Dataset):
             return torch.zeros(3, self.img_size, self.img_size), -1
 
 
+def _worker_init(worker_id: int) -> None:
+    try:
+        import cv2
+        cv2.setNumThreads(1)
+    except ImportError:
+        pass
+
+
 def build_prototypes(model, transform, device: str, data_dir: str, img_size: int,
                      class_map_names, batch_size: int = 64, num_workers: int = 8,
-                     threshold_quantile: float = 0.97, aug: bool = True, aug_views: int = 2):
+                     threshold_quantile: float = 0.97, aug: bool = True, aug_views: int = 2,
+                     aug_max_per_class: int = 100, cpu_aug: bool = False):
     """Compute an L2-normalized mean feature per class from the training split.
 
     Only the classes listed in `class_map_names` are used, in that order (folders not in the
@@ -139,7 +181,7 @@ def build_prototypes(model, transform, device: str, data_dir: str, img_size: int
             print(f'{cls:12s}: WARNING — listed in class-map but no folder under {train_root}')
             continue
         imgs = [p for p in sorted(glob.glob(os.path.join(cls_dir, '*')))
-                if p.lower().endswith(_IMG_EXTS)]
+                if p.lower().endswith(_IMG_EXTS) and not os.path.islink(p)]
         if not imgs:
             print(f'{cls:12s}: WARNING — folder exists but has no images — skipped')
             continue
@@ -155,46 +197,114 @@ def build_prototypes(model, transform, device: str, data_dir: str, img_size: int
 
     model.eval()
 
-    def _extract(tf):
-        """Feature-extract all samples with transform `tf`, grouped by class index."""
+    def _extract(tf, sample_list=None, repeat: int = 1, gpu_aug: torch.nn.Module | None = None,
+                 track_paths: bool = False):
+        """Feature-extract samples with transform `tf`, grouped by class index.
+
+        sample_list defaults to all samples. repeat > 1 tiles the list so stochastic
+        augmentation produces multiple independent views in a single DataLoader pass.
+        gpu_aug: optional _GpuAugBatch module applied on-device before the backbone.
+        track_paths: if True, also return pbc (paths by class, parallel to fbc).
+        """
+        src = sample_list if sample_list is not None else samples
+        actual = src * repeat if repeat > 1 else src
         loader = torch.utils.data.DataLoader(
-            _FeatDataset(samples, tf, img_size),
+            _FeatDataset(actual, tf, img_size),
             batch_size=batch_size, num_workers=num_workers,
             pin_memory=(str(device) != 'cpu'),
+            worker_init_fn=_worker_init,
         )
         fbc = [[] for _ in class_names]
+        pbc = [[] for _ in class_names] if track_paths else None
+        path_iter = iter(p for p, _ in actual) if track_paths else None
         with torch.inference_mode():
             for x, cls in loader:
                 x = x.to(device, non_blocking=True)
+                if gpu_aug is not None:
+                    x = gpu_aug(x)
                 f = model.forward_head(model.forward_features(x), pre_logits=True)  # [B, 1280]
                 f = F.normalize(f, dim=1).cpu()
                 for fi, ci in zip(f, cls.tolist()):
+                    path = next(path_iter) if track_paths else None
                     if ci >= 0:                               # skip unreadable (ci == -1)
                         fbc[ci].append(fi)
-        return fbc
+                        if pbc is not None:
+                            pbc[ci].append(path)
+        return (fbc, pbc) if track_paths else fbc
 
     # PROTOTYPE from clean images (matches inference preprocessing; keep it on the clean manifold).
-    feats_by_class = _extract(transform)
+    feats_by_class, paths_by_class = _extract(transform, track_paths=True)
 
-    # THRESHOLD distances: from npaug-augmented views (widens the spread to real-world variation)
-    # when aug is on; otherwise from the same clean features.
+    # THRESHOLD distances: augmented views to widen the in-distribution distance spread.
+    # GPU mode (default): workers decode+resize only, _GpuAugBatch runs on GPU — fast.
+    # CPU mode (--cpu-aug): _NpAugTransform (albumentations/npaug) runs in workers — faithful
+    #   to training augmentation but slower.
+    # Both modes subsample to aug_max_per_class per class for the aug pass.
     if aug:
-        aug_tf = _NpAugTransform(img_size)
-        thr_feats_by_class = [[] for _ in class_names]
-        for _ in range(max(1, aug_views)):
-            for i, fl in enumerate(_extract(aug_tf)):
-                thr_feats_by_class[i] += fl
+        import random as _random
+        by_class: list[list] = [[] for _ in class_names]
+        for p, ci in samples:
+            by_class[ci].append((p, ci))
+        rng = _random.Random(0)
+        aug_sample_list: list = []
+        for cls_samples in by_class:
+            cap = aug_max_per_class if aug_max_per_class > 0 else len(cls_samples)
+            chosen = rng.sample(cls_samples, min(cap, len(cls_samples)))
+            aug_sample_list.extend(chosen)
+        n_aug = len(aug_sample_list) * max(1, aug_views)
+        backend = 'CPU npaug' if cpu_aug else 'GPU torchvision'
+        print(f'aug threshold pass: {len(aug_sample_list)} images × {aug_views} views = {n_aug} total '
+              f'(capped at {aug_max_per_class}/class, {backend})')
+        if cpu_aug:
+            aug_tf = _NpAugTransform(img_size)
+            thr_feats_by_class = _extract(aug_tf, sample_list=aug_sample_list,
+                                          repeat=max(1, aug_views))
+        else:
+            gpu_aug = _GpuAugBatch(img_size).to(device).eval()
+            raw_tf = _build_raw_transform(img_size)
+            thr_feats_by_class = _extract(raw_tf, sample_list=aug_sample_list,
+                                          repeat=max(1, aug_views), gpu_aug=gpu_aug)
     else:
         thr_feats_by_class = feats_by_class
 
+    OUTLIER_THR = 0.5   # cosine dist > 0.5 ≈ nearly orthogonal; same-class images should be << 0.2
+    outlier_root = Path(data_dir) / 'outlier'
     prototypes, thresholds = {}, {}
     for i, cls in enumerate(class_names):
         if not feats_by_class[i]:
             continue
         feats = torch.stack(feats_by_class[i])               # [N, 1280] clean
+
+        # Robust prototype: exclude outliers before computing the final mean.
+        proto0 = F.normalize(feats.mean(dim=0), dim=0)
+        dists0 = 1.0 - (feats @ proto0)
+        outlier_mask = dists0 > OUTLIER_THR
+        n_out = int(outlier_mask.sum())
+        if n_out:
+            paths = paths_by_class[i]
+            outlier_cls_dir = outlier_root / cls
+            outlier_cls_dir.mkdir(parents=True, exist_ok=True)
+            print(f'{cls:12s}: WARNING — {n_out}/{len(feats)} outlier(s) excluded '
+                  f'(dist>{OUTLIER_THR}) → {outlier_cls_dir}')
+            for j, is_out in enumerate(outlier_mask.tolist()):
+                if is_out:
+                    src = Path(paths[j])
+                    dst = outlier_cls_dir / src.name
+                    shutil.copy2(src, dst)
+                    print(f'               dist={dists0[j]:.4f}  {paths[j]}')
+            feats = feats[~outlier_mask]
+            if len(feats) == 0:
+                print(f'{cls:12s}: WARNING — all images are outliers, class skipped')
+                continue
+
         proto = F.normalize(feats.mean(dim=0), dim=0)        # normalized class mean
         prototypes[cls] = proto
         thr_feats = torch.stack(thr_feats_by_class[i]) if thr_feats_by_class[i] else feats
+        # Also filter aug outliers against the clean prototype
+        thr_dists = 1.0 - (thr_feats @ proto)
+        thr_feats = thr_feats[thr_dists <= OUTLIER_THR]
+        if len(thr_feats) == 0:
+            thr_feats = feats
         dists = 1.0 - (thr_feats @ proto)                    # distances used for the threshold
         # PER-CLASS threshold: this class's own distance spread, not a single global value
         # (a global threshold is dominated by diffuse catch-all classes like 'others').
@@ -287,6 +397,7 @@ def export_openset_pt(model, prototypes, class_names, thresholds, output_path, i
     net = _OpenSetWrapper(model.cpu(), proto_mat, thresh_vec, no_argmin=no_argmin).eval()
     example = torch.zeros(1, 3, img_size, img_size)
     ts = torch.jit.trace(net, example)
+    Path(output_path).parent.mkdir(parents=True, exist_ok=True)
     ts.save(output_path)
     meta = {'class_names': list(class_names),
             'thresholds': [float(thresholds[c]) for c in class_names],
@@ -486,7 +597,11 @@ def main():
         '--aug', action=argparse.BooleanOptionalAction, default=True,
         help='use npaug augmentation to calibrate thresholds (prototype stays clean); --no-aug to disable',
     )
-    parser.add_argument('--aug-views', default=2, type=int, help='augmented passes for thresholds (default: 2)')
+    parser.add_argument('--aug-views', default=2, type=int, help='augmented views per image for thresholds (default: 2)')
+    parser.add_argument('--aug-max-per-class', default=100, type=int,
+                        help='max images per class for aug threshold pass (default: 100); 0 = use all')
+    parser.add_argument('--cpu-aug', action='store_true', default=False,
+                        help='use CPU npaug (albumentations) instead of GPU torchvision aug for thresholds')
     args = parser.parse_args()
 
     transform = build_transform(args.img_size)
@@ -536,7 +651,8 @@ def main():
     print('Building class prototypes from training set...')
     prototypes, class_names, thresholds = build_prototypes(
         model, transform, device, args.data_dir, args.img_size, class_map_names,
-        threshold_quantile=args.quantile, aug=args.aug, aug_views=args.aug_views)
+        threshold_quantile=args.quantile, aug=args.aug, aug_views=args.aug_views,
+        aug_max_per_class=args.aug_max_per_class or 0, cpu_aug=args.cpu_aug)
     print(f'\nPer-class thresholds computed ({len(class_names)} classes, quantile={args.quantile}, '
           f'aug={args.aug})\n')
 
@@ -576,6 +692,22 @@ def main():
         label, dist, nearest = predict(img_path)
         print(f'{img_path}')
         print(f'  → prediction: {label}  (nearest: {nearest}, dist={dist:.4f})')
+
+    # Predict on outlier folder (outliers flagged during prototype building).
+    outlier_root = Path(args.data_dir) / 'outlier'
+    if outlier_root.exists():
+        outlier_imgs = sorted(
+            p for p in outlier_root.rglob('*')
+            if p.is_file() and p.suffix.lower() in _IMG_EXTS
+        )
+        if outlier_imgs:
+            print(f'\n--- outlier predictions ({len(outlier_imgs)} files) ---')
+            for p in outlier_imgs:
+                true_cls = p.parent.name          # folder name = original class
+                label, dist, nearest = predict(str(p))
+                marker = '' if label == true_cls else f'  ← expected {true_cls}'
+                print(f'{p}')
+                print(f'  → {label}  (nearest: {nearest}, dist={dist:.4f}){marker}')
 
 def dump_layer():
     model = onnx.load('nptools/model_openset.onnx')
