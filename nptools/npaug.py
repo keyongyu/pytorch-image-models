@@ -145,7 +145,8 @@ def build_aug_pipeline(img_size=224):
                     brightness_limit=(-0.5, 0.3), contrast_limit=(-0.3, 0.4)
                 ),
                 A.HueSaturationValue(
-                    hue_shift_limit=25, sat_shift_limit=50, val_shift_limit=30
+                    #hue_shift_limit=25, sat_shift_limit=50, val_shift_limit=30
+                    hue_shift_limit=2, sat_shift_limit=20, val_shift_limit=30
                 ),
                 A.RGBShift(r_shift_limit=25, g_shift_limit=25, b_shift_limit=25),
                 A.RandomGamma(gamma_limit=(80, 150)),
