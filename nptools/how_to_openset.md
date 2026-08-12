@@ -72,16 +72,23 @@ Repeat step 2 for every product/class. Tuning (`--margin`, QC thresholds, etc.) 
 
 ---
 
-## 3. Add an `others` / unknown bucket (recommended)
+## 3. (softmax only) Add an `others` / unknown bucket
 
-Create `<DATA>/train/others/` with miscellaneous non-target images. **Do NOT list it in the
-class-map** — it will be:
-- **excluded from training** (the reader drops folders not in the class-map),
-- **excluded from prototypes** (openset builds prototypes only for class-map names),
-- available as the **negative / unknown set** for calibrating and testing the reject threshold.
+**Recommended for a plain softmax classifier, NOT for this ArcFace open-set workflow.**
 
-(Training `others` as an ArcFace class is a bad idea — it's heterogeneous and fights ArcFace's
-compactness objective. Keep it out of the map.)
+- **Softmax classification:** add an explicit `others` / background class so the network has a place
+  to send unknowns (the classic background-class approach to open-set with softmax). There it earns
+  its keep.
+- **ArcFace open-set (this pipeline):** **no longer recommended.** Reject is decided by per-class
+  **cosine-distance thresholds** calibrated on in-distribution (augmented) data (step 8), so unknowns
+  are handled *geometrically* by distance-to-prototype — an `others` bucket is not needed for the
+  decision. And you must not train it as a class anyway: `others` is heterogeneous and fights
+  ArcFace's compactness objective, so a single `others` prototype is meaningless.
+
+If you already have an `others/` folder (e.g. for evaluation), it does no harm as long as you **keep
+it out of the class-map** — the reader drops folders not in the map, and `openset.py` builds
+prototypes only for class-map names. It can still be handy as a **negative set to spot-check** the
+reject threshold (step 10), but it is not part of building the model.
 
 ---
 
@@ -118,8 +125,8 @@ Eyeball `/tmp/aug_check/posm_18/` — confirm the object (and its foot) survives
 
 ## 6. Reduce class imbalance (oversample minority classes)
 
-Classes built from video have very different image counts (a 142-frame clip vs a 51-frame one, and a
-large `others`). `reduce_imbalance.py` evens the training signal by **symlink-oversampling**: every
+Classes built from video have very different image counts (a 142-frame clip vs a 51-frame one).
+`reduce_imbalance.py` evens the training signal by **symlink-oversampling**: every
 class with fewer than `--ratio` × the largest class's image count is topped up to that count with
 symlinks to its own images (cycled). Symlinks keep disk usage flat, and because training re-augments
 each epoch, a symlinked duplicate behaves like a fresh sample — balancing per-class gradients (and
@@ -235,7 +242,8 @@ uv run python nptools/openset.py --load-onnx nptools/openset.onnx --image sample
 
 Decision at inference: nearest prototype by cosine distance; if `dist > threshold[that class]` →
 **unknown / new product**, else the matched class. Sanity-check that real products in `val/`/`test/`
-are accepted and `others/` items are rejected; adjust `--quantile` if needed and re-export.
+are accepted; if you kept an `others/` set (step 3), confirm its items are rejected. Adjust
+`--quantile` if needed and re-export.
 
 ---
 
