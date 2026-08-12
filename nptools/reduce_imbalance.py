@@ -16,6 +16,7 @@ duplicates, and the balancing is recomputed from the real images each time.
 
 CLI:
     python -m nptools.reduce_imbalance --data-dir /path/to/dataset [--split train] [--dry-run]
+    python -m nptools.reduce_imbalance --data-dir /path/to/dataset --clean   # remove the symlinks
 """
 import os
 import glob
@@ -53,6 +54,46 @@ def _list_originals(cls_dir: str) -> list:
         and not os.path.islink(os.path.join(cls_dir, name))
         and _is_image(os.path.join(cls_dir, name))
     )
+
+
+def clean_dups(data_dir: str, split: str = 'train', dry_run: bool = False):
+    """Remove every ``_IMBAL_PREFIX`` symlink this script previously created, restoring the split
+    to its original (real-image-only) state. Does not touch originals.
+
+    Args:
+        data_dir: dataset root containing the split folder.
+        split: split subfolder holding per-class image folders (default ``train``).
+        dry_run: report what would be removed without deleting anything.
+    """
+    split_dir = os.path.join(data_dir, split)
+    if not os.path.isdir(split_dir):
+        raise SystemExit(f'{split_dir} not found (expected <data_dir>/{split}/<class>/*)')
+
+    class_dirs = sorted(
+        d for d in glob.glob(os.path.join(split_dir, '*')) if os.path.isdir(d)
+    )
+    if not class_dirs:
+        raise SystemExit(f'No class subfolders under {split_dir}')
+
+    print(f'Split: {split_dir}')
+    total_removed = 0
+    for cls_dir in class_dirs:
+        cls = os.path.basename(cls_dir)
+        if dry_run:
+            n = sum(
+                1 for name in os.listdir(cls_dir)
+                if name.startswith(_IMBAL_PREFIX) and os.path.islink(os.path.join(cls_dir, name))
+            )
+        else:
+            n = _clear_previous_dups(cls_dir)
+        if n:
+            print(f'{cls:20s}: {n:5d} {_IMBAL_PREFIX}* symlinks')
+        total_removed += n
+
+    action = 'would remove' if dry_run else 'removed'
+    print(f'\nDone: {action} {total_removed} {_IMBAL_PREFIX}* symlinks across {len(class_dirs)} classes.')
+    if dry_run:
+        print('(dry-run — nothing deleted; re-run without --dry-run to apply)')
 
 
 def reduce_imbalance(data_dir: str, split: str = 'train', ratio: float = 0.5, dry_run: bool = False):
@@ -131,8 +172,14 @@ def main():
                              '(default: 0.5 = half of the most-populated class)')
     parser.add_argument('--dry-run', action='store_true',
                         help='report the plan without creating symlinks')
+    parser.add_argument('--clean', action='store_true',
+                        help=f'remove all {_IMBAL_PREFIX}* symlinks created by this script and exit '
+                             '(no oversampling)')
     args = parser.parse_args()
-    reduce_imbalance(args.data_dir, split=args.split, ratio=args.ratio, dry_run=args.dry_run)
+    if args.clean:
+        clean_dups(args.data_dir, split=args.split, dry_run=args.dry_run)
+    else:
+        reduce_imbalance(args.data_dir, split=args.split, ratio=args.ratio, dry_run=args.dry_run)
 
 
 if __name__ == '__main__':
