@@ -1,7 +1,7 @@
 #!/bin/sh
  
  # background images for nobg bg-swap augmentation (read by nptools/npaug.py)
-export NOBG_BG_DIR=/home/keyong/cls6/bg_photos
+export NOBG_BG_DIR="${NOBG_BG_DIR:-/home/keyong/cls6/bg_photos}"
 #export AUG_DUMP_DIR=kytest/after_aug
 
 # Keep native math/threading libs single-threaded inside each DataLoader worker; parallelism
@@ -10,7 +10,7 @@ export OMP_NUM_THREADS=1
 
 # Defaults (override via the script-level flags below).
 DATA_DIR=/home/keyong/cls2/code/posmlv
-OUTPUT_DIR=/home/keyong/cls2/code/posmlv/output
+OUTPUT_DIR=""
 CLASS_MAP=""
 
  # Consume script-level flags here (not forwarded to train.py); anything else is
@@ -19,7 +19,7 @@ CLASS_MAP=""
  # "--flag=value" forms are accepted.
  #   --new              fresh run from the pretrained backbone, ignore last.pth.tar
  #   --data-dir  PATH   dataset root        (default: $DATA_DIR)
- #   --output-dir PATH  output/checkpoints  (default: $OUTPUT_DIR)
+ #   --output-dir PATH  output/checkpoints  (default: $DATA_DIR/output)
  #   --class-map PATH   class-map file      (default: $DATA_DIR/class_84.txt)
  usage() {
      cat <<EOF
@@ -31,7 +31,7 @@ not forwarded); any other argument is passed straight through to train.py.
 Options:
   --new              Fresh run from the pretrained backbone; ignore last.pth.tar.
   --data-dir  PATH   Dataset root.        (default: $DATA_DIR)
-  --output-dir PATH  Output/checkpoints.  (default: $OUTPUT_DIR)
+  --output-dir PATH  Output/checkpoints.  (default: \$DATA_DIR/output)
   --class-map PATH   Class-map file.      (default: \$DATA_DIR/class_84.txt)
   --test-npaug-dir PATH  DRY-RUN: no training; dump augmented images (grouped by class)
                      to PATH for <=4 epochs to visually test nptools/npaug.py.
@@ -72,8 +72,9 @@ EOF
      shift
  done
 
- # class-map defaults relative to the (possibly overridden) data dir.
- [ -n "$CLASS_MAP" ] || CLASS_MAP="${DATA_DIR}/class_84.txt"
+ # output-dir and class-map default relative to the (possibly overridden) data dir.
+ [ -n "$OUTPUT_DIR" ] || OUTPUT_DIR="${DATA_DIR}/output"
+ [ -n "$CLASS_MAP" ] || CLASS_MAP="${DATA_DIR}/classmap.txt"
 
  # Derive --num-classes from the class-map (count non-empty lines) instead of hardcoding.
 NUM_CLASSES=$(grep -cve '^[[:space:]]*$' "${CLASS_MAP}")
