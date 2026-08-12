@@ -3,15 +3,16 @@ Shared augmentation pipeline.
 Imported by both augment_v2.py (offline) and dataset.py (online training).
 """
 
-import random
+import glob
 import os
+import random
+from typing import Optional, Tuple, Union
+
 import albumentations as A
 import cv2
 import numpy as np
-import glob
 import torch
 from PIL import Image as PILImage
-from typing import Optional, Tuple, Union
 
 # This module is imported inside every DataLoader worker. By default OpenCV spins up a
 # thread pool sized to the CPU count (32 here), so N workers => N*32 threads fighting for
@@ -99,6 +100,44 @@ class RandomSpotlight(A.ImageOnlyTransform):
 
     def get_transform_init_args_names(self):
         return ("intensity_range",)
+
+
+class AtmosphericFog(A.ImageOnlyTransform):
+    """Fast, vectorized fog using the atmospheric scattering (Koschmieder) model.
+
+    Drop-in replacement for A.RandomFog, which simulates individual fog particles in a
+    Python loop (~375 ms/img); this is a single elementwise blend (~1-3 ms/img):
+
+        out = img * t + A * (1 - t)
+
+    where A is the atmospheric light (fog color) and t is a spatially-varying transmission
+    map. t is built from a smooth low-frequency field (tiny random grid upsampled) times a
+    vertical gradient (denser toward the top), so the fog reads as depth rather than a flat
+    haze wash.
+    """
+
+    def __init__(self, fog_coef_range=(0.1, 0.4), light_range=(190, 255), p=0.5):
+        super().__init__(p=p)
+        self.fog_coef_range = fog_coef_range
+        self.light_range = light_range
+
+    def apply(self, img, coef, light, field, **params):
+        h, w = img.shape[:2]
+        # smooth low-frequency transmission field upsampled from the tiny grid
+        field = cv2.resize(field, (w, h), interpolation=cv2.INTER_LINEAR)
+        vgrad = np.linspace(1.0, 0.6, h, dtype=np.float32)[:, None]  # denser toward the top
+        t = (1.0 - coef * field * vgrad)[..., None]                  # transmission in (0, 1]
+        return (img.astype(np.float32) * t + light * (1.0 - t)).astype(np.uint8)
+
+    def get_params(self):
+        return {
+            "coef": random.uniform(*self.fog_coef_range),
+            "light": random.randint(*self.light_range),
+            "field": np.random.rand(8, 8).astype(np.float32),
+        }
+
+    def get_transform_init_args_names(self):
+        return ("fog_coef_range", "light_range")
 
 
 class BottomBiggerPerspective(A.Perspective):
@@ -226,7 +265,8 @@ def build_aug_pipeline(img_size=224):
                 # weather family (pick one)
                 A.OneOf(
                     [
-                        A.RandomFog(fog_coef_range=(0.1, 0.4), alpha_coef=0.1),
+                        # A.RandomFog(fog_coef_range=(0.1, 0.4), alpha_coef=0.1),  # ~375ms/img -> replaced
+                        AtmosphericFog(fog_coef_range=(0.3, 0.7)),
                         A.RandomRain(
                             slant_range=(-15, 15),
                             drop_length=10,
@@ -345,7 +385,8 @@ def build_shape_preserving_pipeline(img_size=224, fill=(255, 255, 255)):
         # — Weather —
         A.OneOf(
             [
-                A.RandomFog(fog_coef_range=(0.1, 0.4), alpha_coef=0.1),
+                # A.RandomFog(fog_coef_range=(0.1, 0.4), alpha_coef=0.1),  # ~375ms/img -> replaced
+                AtmosphericFog(fog_coef_range=(0.3, 0.7)),
                 A.RandomRain(slant_range=(-15, 15), drop_length=10, drop_width=1,
                              drop_color=(200, 200, 200), blur_value=3,
                              brightness_coefficient=0.85, rain_type="default"),
@@ -391,7 +432,8 @@ def build_photometric_pipeline():
         ),
         A.OneOf(
             [
-                A.RandomFog(fog_coef_range=(0.1, 0.4), alpha_coef=0.1),
+                # A.RandomFog(fog_coef_range=(0.1, 0.4), alpha_coef=0.1),  # ~375ms/img -> replaced
+                AtmosphericFog(fog_coef_range=(0.3, 0.7)),
                 A.RandomRain(slant_range=(-15, 15), drop_length=10, drop_width=1,
                              drop_color=(200, 200, 200), blur_value=3,
                              brightness_coefficient=0.85, rain_type="default"),
