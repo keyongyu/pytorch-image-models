@@ -207,8 +207,8 @@ def main():
     p.add_argument('--dest-dir', required=True, help='output root for cutouts and jpg crops')
     p.add_argument('--model', default='birefnet-massive', help='rembg model (default: birefnet-massive)')
     p.add_argument('--pad', type=int, default=80, help='white pad before removal, px (default: 80)')
-    p.add_argument('--margin', type=float, default=0.10,
-                   help='bbox expansion fraction per side (default: 0.10 -> object fills 1/1.2^2 ~= 70%% of the png)')
+    p.add_argument('--margin', type=float, default=0.02,
+                   help='bbox expansion fraction per side (default: 0.02 -> object fills 1/1.04^2 ~= 92%% of the png)')
     p.add_argument('--close', type=int, default=21, help='morphological close kernel px (default: 21)')
     p.add_argument('--step', type=int, default=1, help='process every Nth frame (default: 1 = all)')
     p.add_argument('--max-partial', type=float, default=0.20,
