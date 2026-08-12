@@ -32,6 +32,33 @@ _DEFAULT_DATA_DIR = os.path.join(_HERE, '..', 'posmlv')
 _DEFAULT_IMG_SIZE = 224
 
 
+def _short_path(path, root) -> str:
+    """Path relative to `root` for compact stdout logging.
+
+    Falls back to the original string when `path` is not under `root` (e.g. a `--image` elsewhere
+    or a different drive), so the printed path is always valid.
+    """
+    try:
+        rel = os.path.relpath(str(path), str(root))
+    except ValueError:                     # different drive on Windows
+        return str(path)
+    return rel if not rel.startswith('..') else str(path)
+
+
+def _write_aligned_csv(path, header, rows) -> None:
+    """Write `header` + `rows` as a comma-separated file, space-padded so columns line up.
+
+    Each column is padded to its widest cell; any CSV reader that strips surrounding whitespace
+    parses it unchanged. Creates the parent directory if needed.
+    """
+    Path(path).parent.mkdir(parents=True, exist_ok=True)
+    table = [tuple(header)] + [tuple(r) for r in rows]
+    widths = [max(len(row[c]) for row in table) for c in range(len(header))]
+    with open(path, 'w') as f:
+        for row in table:
+            f.write(', '.join(cell.ljust(widths[c]) for c, cell in enumerate(row)).rstrip() + '\n')
+
+
 def _read_class_names(class_map_path: str) -> list:
     """Ordered class names from the class-map file (one non-empty line per class).
 
@@ -159,16 +186,41 @@ def _worker_init(worker_id: int) -> None:
         pass
 
 
+def _nearest_other_class(feat: torch.Tensor, own_cls: str, proto_mat, proto_names):
+    """Nearest prototype to `feat` among classes other than `own_cls`.
+
+    Args:
+        feat: L2-normalized feature [D].
+        own_cls: the image's labeled class, excluded from the search.
+        proto_mat: L2-normalized prototype matrix [C, D] (or None if unavailable).
+        proto_names: class names aligned with proto_mat rows.
+
+    Returns:
+        (class_name, cosine_distance) for the closest other class, or (None, None) when
+        there is no other class to compare against.
+    """
+    if proto_mat is None or len(proto_names) < 2:
+        return None, None
+    dists = 1.0 - (proto_mat @ feat)                     # [C] cosine distance to every class
+    dists = dists.clone()
+    dists[proto_names.index(own_cls)] = float('inf')     # mask out the own class
+    nn_idx = int(dists.argmin())
+    return proto_names[nn_idx], float(dists[nn_idx])
+
+
 def build_prototypes(model, transform, device: str, data_dir: str, img_size: int,
                      class_map_names, batch_size: int = 64, num_workers: int = 8,
                      threshold_quantile: float = 0.97, aug: bool = True, aug_views: int = 2,
-                     aug_max_per_class: int = 100, cpu_aug: bool = False):
+                     aug_max_per_class: int = 100, cpu_aug: bool = False, copy_inliers: bool = False):
     """Compute an L2-normalized mean feature per class from the training split.
 
     Only the classes listed in `class_map_names` are used, in that order (folders not in the
     class-map are ignored). A class-map entry whose folder is missing or has no images is warned
     about and skipped. Parallelized: decode across `num_workers` workers, backbone on batches.
     `class_names` (return) stays aligned with the prototype matrix used for export/inference.
+
+    If `copy_inliers` is set, the good inlier crops (cosine dist <= OUTLIER_THR to their class
+    prototype) are copied into `<data_dir>/inlier/<class>/` for training a clean classifier.
     """
     t_start = time.time()
     train_root = os.path.join(data_dir, 'train')
@@ -269,6 +321,19 @@ def build_prototypes(model, transform, device: str, data_dir: str, img_size: int
 
     OUTLIER_THR = 0.5   # cosine dist > 0.5 ≈ nearly orthogonal; same-class images should be << 0.2
     outlier_root = Path(data_dir) / 'outlier'
+    inlier_root = Path(data_dir) / 'inlier'   # clean (dist<=thr) images, for training a clean classifier
+    n_inliers_copied = 0
+    outlier_rows = []   # CSV rows: (classtype/file, bad_dist, nearest_type, nearest_dist)
+    inlier_rows = []    # CSV rows: (classtype/file, distance) — only when copy_inliers
+
+    # Pre-pass: an initial (pre-exclusion) mean prototype per class, used only to tell WHICH other
+    # class an outlier is closest to (mislabel diagnosis vs. genuine unknown). Not the final proto.
+    init_proto_names = [cls for i, cls in enumerate(class_names) if feats_by_class[i]]
+    init_proto_mat = torch.stack([
+        F.normalize(torch.stack(feats_by_class[i]).mean(dim=0), dim=0)
+        for i, cls in enumerate(class_names) if feats_by_class[i]
+    ]) if init_proto_names else None                     # [C, D], L2-normalized
+
     prototypes, thresholds = {}, {}
     for i, cls in enumerate(class_names):
         if not feats_by_class[i]:
@@ -285,17 +350,41 @@ def build_prototypes(model, transform, device: str, data_dir: str, img_size: int
             outlier_cls_dir = outlier_root / cls
             outlier_cls_dir.mkdir(parents=True, exist_ok=True)
             print(f'{cls:12s}: WARNING — {n_out}/{len(feats)} outlier(s) excluded '
-                  f'(dist>{OUTLIER_THR}) → {outlier_cls_dir}')
+                  f'(dist>{OUTLIER_THR}) → {_short_path(outlier_cls_dir, data_dir)}')
             for j, is_out in enumerate(outlier_mask.tolist()):
                 if is_out:
                     src = Path(paths[j])
                     dst = outlier_cls_dir / src.name
                     shutil.copy2(src, dst)
-                    print(f'               dist={dists0[j]:.4f}  {paths[j]}')
+                    # Nearest OTHER class: small → likely mislabel; large → genuine unknown.
+                    near_cls, near_dist = _nearest_other_class(
+                        feats[j], cls, init_proto_mat, init_proto_names)
+                    near_str = (f'nearest_other={near_cls} ({near_dist:.4f})'
+                                if near_cls is not None else 'nearest_other=n/a')
+                    print(f'               dist={dists0[j]:.4f}  {near_str}  '
+                          f'{_short_path(paths[j], data_dir)}')
+                    outlier_rows.append((
+                        f'{cls}/{src.name}', f'{float(dists0[j]):.4f}',
+                        near_cls if near_cls is not None else '',
+                        f'{near_dist:.4f}' if near_dist is not None else '',
+                    ))
             feats = feats[~outlier_mask]
             if len(feats) == 0:
                 print(f'{cls:12s}: WARNING — all images are outliers, class skipped')
                 continue
+
+        # Copy the good inliers (dist<=thr) into inlier/<cls>/ for training a clean classifier,
+        # recording each one's distance to its own class prototype for inlier.txt.
+        if copy_inliers:
+            inlier_cls_dir = inlier_root / cls
+            inlier_cls_dir.mkdir(parents=True, exist_ok=True)
+            for j, is_out in enumerate(outlier_mask.tolist()):
+                if is_out:
+                    continue
+                src = Path(paths_by_class[i][j])
+                shutil.copy2(src, inlier_cls_dir / src.name)
+                inlier_rows.append((f'{cls}/{src.name}', f'{float(dists0[j]):.4f}'))
+                n_inliers_copied += 1
 
         proto = F.normalize(feats.mean(dim=0), dim=0)        # normalized class mean
         prototypes[cls] = proto
@@ -315,6 +404,15 @@ def build_prototypes(model, transform, device: str, data_dir: str, img_size: int
 
     # keep class_names aligned with classes that produced a prototype
     class_names = [c for c in class_names if c in prototypes]
+    if outlier_rows:
+        csv_path = outlier_root / 'outlier.txt'
+        _write_aligned_csv(
+            csv_path, ('classtype/file', 'bad_dist', 'nearest_type', 'nearest_dist'), outlier_rows)
+        print(f'outlier list: {len(outlier_rows)} rows → {_short_path(csv_path, data_dir)}')
+    if copy_inliers:
+        print(f'inliers copied: {n_inliers_copied} images → {_short_path(inlier_root, data_dir)}')
+        if inlier_rows:
+            _write_aligned_csv(inlier_root / 'inlier.txt', ('classtype/file', 'distance'), inlier_rows)
     print(f'build_prototypes: {len(class_names)} classes, {len(samples)} images '
           f'in {time.time() - t_start:.1f}s')
     return prototypes, class_names, thresholds
@@ -477,16 +575,57 @@ def predict_openset(model, transform, prototypes, class_names, thresholds, img_p
     return nearest, best_dist, nearest
 
 
-def load_openset_onnx(onnx_path: str) -> ort.InferenceSession:
-    """Load an exported open-set ONNX model for CPU inference.
+@torch.no_grad()
+def predict_openset_many(model, transform, prototypes, class_names, thresholds, img_paths, device,
+                         img_size, batch_size=64, num_workers=8):
+    """Batched open-set prediction over many images (DataLoader decode + batched backbone).
+
+    Much faster than calling predict_openset per image: workers decode/transform in parallel and the
+    backbone runs on batches. Results are returned in the same order as `img_paths`; an unreadable
+    image yields ('unreadable', nan, '').
+    """
+    proto_mat = torch.stack([prototypes[c] for c in class_names]).to(device)   # [C, D]
+    model.eval()
+    loader = torch.utils.data.DataLoader(
+        _FeatDataset([(p, i) for i, p in enumerate(img_paths)], transform, img_size),
+        batch_size=batch_size, num_workers=num_workers,
+        pin_memory=(str(device) != 'cpu'), worker_init_fn=_worker_init,
+    )   # map-style + default sampler ⇒ order preserved, so results stay aligned with img_paths
+    results = []
+    with torch.inference_mode():
+        for x, cls in loader:
+            x = x.to(device, non_blocking=True)
+            f = model.forward_head(model.forward_features(x), pre_logits=True)  # [B, D]
+            f = F.normalize(f, dim=1)
+            dists = 1.0 - (f @ proto_mat.t())                                   # [B, C]
+            best = dists.argmin(dim=1)
+            for b, ci in enumerate(cls.tolist()):
+                if ci < 0:                                     # unreadable (marked by _FeatDataset)
+                    results.append(('unreadable', float('nan'), ''))
+                    continue
+                bi = int(best[b])
+                bd = float(dists[b, bi])
+                nearest = class_names[bi]
+                label = 'unknown' if bd > thresholds[nearest] else nearest
+                results.append((label, bd, nearest))
+    return results
+
+
+def load_openset_onnx(onnx_path: str, use_gpu: bool = False) -> ort.InferenceSession:
+    """Load an exported open-set ONNX model for inference.
 
     Args:
         onnx_path: Path to the .onnx file produced by export_openset_onnx.
+        use_gpu: prefer CUDAExecutionProvider (falls back to CPU if unavailable). Default CPU,
+            which mirrors the ncnn deployment target for verification.
 
     Returns:
         An onnxruntime InferenceSession ready for inference.
     """
-    session = ort.InferenceSession(onnx_path, providers=['CPUExecutionProvider'])
+    providers = ['CPUExecutionProvider']
+    if use_gpu and 'CUDAExecutionProvider' in ort.get_available_providers():
+        providers = ['CUDAExecutionProvider', 'CPUExecutionProvider']
+    session = ort.InferenceSession(onnx_path, providers=providers)
     return session
 
 
@@ -533,15 +672,16 @@ def predict_onnx(
 
 
 @torch.no_grad()
-def predict_pt(ts_model, transform, class_names, img_path, no_argmin=False):
-    """Run open-set inference on one image via a TorchScript open-set model (CPU).
+def predict_pt(ts_model, transform, class_names, img_path, no_argmin=False, device='cpu'):
+    """Run open-set inference on one image via a TorchScript open-set model.
 
     Returns (label, best_dist, nearest) — 'unknown' when the baked-in per-class margin > 0.
     ``no_argmin`` mirrors the export flag: True → the model returns per-class ``dists``/``margins``
     vectors and the argmin is done here; False → the model returns the scalar decision directly.
+    ``device`` must match where ``ts_model`` lives ('cpu' or 'cuda').
     """
     img = Image.open(img_path).convert('RGB')
-    x = transform(img).unsqueeze(0)                    # [1, 3, H, W] float32
+    x = transform(img).unsqueeze(0).to(device)         # [1, 3, H, W] float32
     if no_argmin:
         dists, margins = ts_model(x)
         dists, margins = dists[0], margins[0]          # [C] (drop batch dim)
@@ -580,8 +720,8 @@ def main():
     )
     parser.add_argument(
         '--load-onnx', default='', type=str, metavar='PATH',
-        help='run inference via ONNX (CPU); skips PyTorch model and prototype building. '
-             'Class names are read from <PATH>.meta.json written at export.',
+        help='run inference via ONNX (CPU by default, GPU with --gpu-predict); skips PyTorch model '
+             'and prototype building. Class names are read from <PATH>.meta.json written at export.',
     )
     parser.add_argument(
         '--no-argmin', action='store_true', default=False,
@@ -602,6 +742,13 @@ def main():
                         help='max images per class for aug threshold pass (default: 100); 0 = use all')
     parser.add_argument('--cpu-aug', action='store_true', default=False,
                         help='use CPU npaug (albumentations) instead of GPU torchvision aug for thresholds')
+    parser.add_argument('--copy-inliers', action='store_true', default=False,
+                        help='copy the good inlier crops (cosine dist<=0.5 to their class prototype) into '
+                             '<data-dir>/inlier/<class>/ for training a clean classifier')
+    parser.add_argument('--gpu-predict', action='store_true', default=False,
+                        help='run prediction/verification on GPU (ONNX CUDA provider, TorchScript + '
+                             'in-memory model on cuda). Default CPU, which mirrors the ncnn deployment '
+                             'target; batched decode is used either way')
     args = parser.parse_args()
 
     transform = build_transform(args.img_size)
@@ -621,13 +768,13 @@ def main():
         print(f'ONNX model : {args.load_onnx}')
         print(f'Classes    : {len(class_names)} (from {meta_path})')
         print(f'Output     : {"dists/margins (client argmin)" if no_argmin else "scalar (in-graph argmin)"}\n')
-        session = load_openset_onnx(args.load_onnx)
+        session = load_openset_onnx(args.load_onnx, use_gpu=args.gpu_predict)
         img_paths = [args.image] if args.image else _scan_eval_images(args.data_dir)
         print(f'  prediction via ONNX model')
         for img_path in img_paths:
             label, dist, nearest = predict_onnx(session, transform, class_names, img_path,
                                                 no_argmin=no_argmin)
-            print(f'{img_path}')
+            print(f'{_short_path(img_path, args.data_dir)}')
             print(f'  → prediction: {label}  (nearest known: {nearest}, dist={dist:.4f})')
         return
 
@@ -652,7 +799,8 @@ def main():
     prototypes, class_names, thresholds = build_prototypes(
         model, transform, device, args.data_dir, args.img_size, class_map_names,
         threshold_quantile=args.quantile, aug=args.aug, aug_views=args.aug_views,
-        aug_max_per_class=args.aug_max_per_class or 0, cpu_aug=args.cpu_aug)
+        aug_max_per_class=args.aug_max_per_class or 0, cpu_aug=args.cpu_aug,
+        copy_inliers=args.copy_inliers)
     print(f'\nPer-class thresholds computed ({len(class_names)} classes, quantile={args.quantile}, '
           f'aug={args.aug})\n')
 
@@ -673,24 +821,31 @@ def main():
         img_paths = _scan_eval_images(args.data_dir)
         print()
 
-    # If a model was exported, verify by predicting through THAT model; otherwise use the
-    # in-memory PyTorch prototypes.
-    if onnx_path is not None:
-        session = load_openset_onnx(onnx_path)
-        print(f'Predicting via exported ONNX model: {onnx_path}\n')
-        predict = lambda p: predict_onnx(session, transform, class_names, p, no_argmin=args.no_argmin)
-    elif pt_path is not None:
-        ts_model = torch.jit.load(pt_path).eval()
-        print(f'Predicting via exported TorchScript model: {pt_path}\n')
-        predict = lambda p: predict_pt(ts_model, transform, class_names, p, no_argmin=args.no_argmin)
-    else:
-        print('Predicting via in-memory PyTorch prototypes\n')
-        predict = lambda p: predict_openset(
-            model, transform, prototypes, class_names, thresholds, p, device)
+    # Prediction/verification device: CPU by default (mirrors ncnn deployment), GPU with --gpu-predict.
+    predict_device = 'cuda' if (args.gpu_predict and torch.cuda.is_available()) else 'cpu'
 
-    for img_path in img_paths:
-        label, dist, nearest = predict(img_path)
-        print(f'{img_path}')
+    # If a model was exported, verify by predicting through THAT model; otherwise use the
+    # in-memory PyTorch prototypes. `predict_many(paths)` returns (label, dist, nearest) per path.
+    if onnx_path is not None:
+        session = load_openset_onnx(onnx_path, use_gpu=args.gpu_predict)
+        print(f'Predicting via exported ONNX model: {onnx_path} [{predict_device}]\n')
+        predict_many = lambda paths: [
+            predict_onnx(session, transform, class_names, p, no_argmin=args.no_argmin) for p in paths]
+    elif pt_path is not None:
+        ts_model = torch.jit.load(pt_path, map_location=predict_device).eval()
+        print(f'Predicting via exported TorchScript model: {pt_path} [{predict_device}]\n')
+        predict_many = lambda paths: [
+            predict_pt(ts_model, transform, class_names, p, no_argmin=args.no_argmin,
+                       device=predict_device) for p in paths]
+    else:
+        model.to(predict_device)
+        print(f'Predicting via in-memory PyTorch prototypes [{predict_device}]\n')
+        predict_many = lambda paths: predict_openset_many(
+            model, transform, prototypes, class_names, thresholds, paths, predict_device,
+            args.img_size)
+
+    for img_path, (label, dist, nearest) in zip(img_paths, predict_many(img_paths)):
+        print(f'{_short_path(img_path, args.data_dir)}')
         print(f'  → prediction: {label}  (nearest: {nearest}, dist={dist:.4f})')
 
     # Predict on outlier folder (outliers flagged during prototype building).
@@ -702,11 +857,11 @@ def main():
         )
         if outlier_imgs:
             print(f'\n--- outlier predictions ({len(outlier_imgs)} files) ---')
-            for p in outlier_imgs:
+            for p, (label, dist, nearest) in zip(outlier_imgs,
+                                                 predict_many([str(x) for x in outlier_imgs])):
                 true_cls = p.parent.name          # folder name = original class
-                label, dist, nearest = predict(str(p))
                 marker = '' if label == true_cls else f'  ← expected {true_cls}'
-                print(f'{p}')
+                print(f'{_short_path(p, args.data_dir)}')
                 print(f'  → {label}  (nearest: {nearest}, dist={dist:.4f}){marker}')
 
 def dump_layer():

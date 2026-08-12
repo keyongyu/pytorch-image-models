@@ -31,6 +31,13 @@ def build_class_map(templates_path: Path) -> tuple[dict[str, str], dict[str, dic
     data = json.loads(templates_path.read_text(encoding="utf-8"))
     skus = data["categories"][0]["skus"]
 
+    # Flat schema (e.g. *_merge datasets): no SKU carries the main/variant
+    # hierarchy fields, so treat every SKU as its own main class in list order.
+    if not any(s.get("is_main") for s in skus):
+        class_map = {s["id"]: {"idx": idx, "name": s["name"]} for idx, s in enumerate(skus)}
+        variant_to_main = {s["id"]: s["id"] for s in skus}
+        return variant_to_main, class_map
+
     # Pass 1: collect exportable main classes in seq order
     # Exclude only no_export entries; sample_img may be empty (e.g. Other Beer)
     mains: list[dict] = []

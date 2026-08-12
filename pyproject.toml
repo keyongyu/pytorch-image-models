@@ -37,7 +37,10 @@ dependencies = [
         "datasets>=3.1.0",
         "pyarrow>=17.0.0",
         "opencv-python-headless>=5.0.0.93",
-        "albumentations"
+        "albumentations",
+        "onnx",
+        "onnxruntime-gpu"
+        
 ]
 dynamic = ["version"]
 

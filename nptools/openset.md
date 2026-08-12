@@ -60,6 +60,8 @@ class-map defines which classes to use, in what order, and — via its line coun
 | `--quantile Q` | no (default 0.97) | per-class reject threshold = this quantile of the class's in-distribution cosine distances (higher ⇒ fewer knowns rejected, more unknowns accepted) |
 | `--aug` / `--no-aug` | no (default `--aug`) | calibrate thresholds from **npaug-augmented** distances (prototype stays clean), widening the spread to real-world variation; `--no-aug` uses clean distances |
 | `--aug-views N` | no (default 2) | number of augmented passes over train used for threshold calibration |
+| `--copy-inliers` | no (default off) | while building prototypes, also copy the **good inlier** crops (cosine dist ≤ 0.5 to their class prototype) into `<data-dir>/inlier/<class>/` — a cleaned training set (see §2.1) |
+| `--gpu-predict` | no (default **CPU**) | run **prediction/verification** on GPU (ONNX `CUDAExecutionProvider`, TorchScript + in-memory model on `cuda`). Default is CPU so verification mirrors the ncnn deployment target. **Prototype building always uses the GPU** regardless of this flag; it only affects the predict/verify pass. |
 | `--export-onnx [PATH]` | no | export ONNX (+ `<PATH>.meta.json`); default `<checkpoint>_openset.onnx` |
 | `--export-pt [PATH]` | no | export TorchScript (+ `<PATH>.meta.json`); default `<checkpoint>_openset.pt` |
 | `--image PATH` | no | classify a single image (else scans `val/` + `test/`) |
@@ -96,6 +98,13 @@ Notes:
   its **elapsed time**.
 - **Prediction source:** with `--image` it's that one image; otherwise it scans **both** `val/`
   and `test/` under `--data-dir`.
+- **Prediction device & speed:** prediction/verification runs on **CPU by default** so it mirrors the
+  ncnn deployment target (the ONNX session uses `CPUExecutionProvider`; the TorchScript/in-memory
+  model runs on CPU). Pass **`--gpu-predict`** to run it on the GPU instead (ONNX
+  `CUDAExecutionProvider` with CPU fallback, TorchScript/in-memory model on `cuda`) — much faster for
+  large `val/`+`test/` sweeps. Image decode is **batched via DataLoader workers** either way; note
+  that after an export, predictions run **through the exported model**, which for the CPU default is
+  intentionally the slow-but-faithful path. Prototype building itself always uses the GPU.
 - **Self-verification:** if you export (`--export-onnx`/`--export-pt`), the subsequent predictions
   run **through the exported model** (ONNX / TorchScript), not the PyTorch prototypes — so any
   conversion discrepancy surfaces immediately. With no export, predictions use the in-memory
@@ -104,6 +113,114 @@ Notes:
   `thresholds` is a per-class list aligned with `class_names`; `no_argmin` records which output
   format was baked in. The client (and `--load-onnx`) reads this to map an output index to a class
   name and to know whether to expect scalar or per-class-vector outputs.
+
+---
+
+## 2.1 Outlier & inlier folders — training-data hygiene
+
+Building prototypes is also a **label-quality audit** of your training crops, for free. For each
+class the mean feature is a prototype, and every crop's cosine distance to *its own* prototype tells
+you how well it fits its label. A fixed gate `OUTLIER_THR = 0.5` (cosine dist > 0.5 ≈ nearly
+orthogonal; same-class crops should sit well under 0.2) splits each class into two groups:
+
+- **outlier** — dist **> 0.5**: the crop looks nothing like the rest of its class. Usually a
+  **mislabel**, a **bad crop** (occluded, blurred, wrong object, background), or a genuinely odd
+  sample. These are **excluded from the prototype mean** (so one bad crop can't drag the prototype
+  off), and — because they'd pollute a classifier — you generally want them **out of training** too.
+- **inlier** — dist **≤ 0.5**: the crop is consistent with its class. These form the robust
+  prototype, and they are the crops worth **training on**.
+
+### Outlier folder (always written when outliers are found)
+
+Outliers are **copied** to `<data-dir>/outlier/<class>/` (originals in `train/` are untouched) and
+each is logged with two distances:
+
+```
+CocaCola    : WARNING — 2/153 outlier(s) excluded (dist>0.5) → .../outlier/CocaCola
+               dist=0.6120  nearest_other=Pepsi (0.0450)   .../train/CocaCola/img_0007.jpg
+               dist=0.5340  nearest_other=OtherDrinks (0.4900)  .../train/CocaCola/img_0088.jpg
+```
+
+- `dist` — distance to the crop's **own** (labeled) class prototype. Large ⇒ it doesn't belong.
+- `nearest_other=<class> (<dist>)` — the **closest other** class prototype and its distance. This
+  disambiguates *why* it's an outlier:
+  - nearest-other **small** (e.g. `Pepsi (0.045)`) → the crop actually looks like that class →
+    likely a **mislabel**; move it there.
+  - nearest-other **also large** (e.g. `0.49`) → far from everything → a **genuine unknown / bad
+    crop**; drop it.
+
+Alongside the copies, a machine-readable summary is written to **`<data-dir>/outlier/outlier.txt`**
+(CSV, one row per outlier, header included) so you can sort/filter the audit instead of scanning the
+log:
+
+```csv
+classtype/file       , bad_dist, nearest_type, nearest_dist
+CocaCola/img_0007.jpg, 0.6120  , Pepsi       , 0.0450
+CocaCola/img_0088.jpg, 0.5340  , OtherDrinks , 0.4900
+```
+
+Columns are comma-separated but **space-padded** so the file also reads as aligned columns; any CSV
+reader that strips surrounding whitespace parses it unchanged.
+
+| column | meaning |
+|---|---|
+| `classtype/file` | `<labeled class>/<filename>` — matches the copied path under `outlier/` |
+| `bad_dist` | cosine distance to its **own** class prototype (the reason it was flagged) |
+| `nearest_type` | closest **other** class prototype (blank if only one class) |
+| `nearest_dist` | cosine distance to `nearest_type` |
+
+Tip: sort by `nearest_dist` ascending to surface the likely **mislabels** first (small
+`nearest_dist` ⇒ the crop belongs to `nearest_type`); rows where `nearest_dist` is also large are
+**genuine unknowns / bad crops**. The file is written whenever any outlier exists (independent of
+`--copy-inliers`).
+
+Review `outlier/` by eye (or sort `outlier.txt`), then fix labels or delete the bad crops in your
+source dataset.
+
+### Inlier folder (opt-in, `--copy-inliers`)
+
+With `--copy-inliers`, the good inliers (dist ≤ 0.5) are **copied** to `<data-dir>/inlier/<class>/`,
+preserving the class-folder layout. The result is a **cleaned mirror of `train/`** with the
+noisy/mislabeled crops removed — point a fresh classifier training run at `inlier/` to learn from
+clean data. A summary line reports the total: `inliers copied: <N> images → <inlier_root>`.
+
+A companion report **`<data-dir>/inlier/inlier.txt`** lists every copied inlier with its distance to
+its own class prototype (same space-padded, comma-separated format as `outlier.txt`):
+
+```csv
+classtype/file                , distance
+CocaCola/img_0007.jpg         , 0.0450
+Other Drinks/CBKZ_770_0013.jpg, 0.1832
+```
+
+| column | meaning |
+|---|---|
+| `classtype/file` | `<class>/<filename>` — matches the copied path under `inlier/` |
+| `distance` | cosine distance to its **own** class prototype (smaller = tighter fit) |
+
+Sort by `distance` **descending** to see the weakest-but-still-accepted crops (borderline cases near
+the 0.5 gate); the tightest crops sit at the top when sorted ascending.
+
+```bash
+# Audit + emit a cleaned training set in one pass (no export needed)
+uv run --no-sync python nptools/openset.py \
+    --data-dir posmlv --class-map posmlv/class_84.txt \
+    --checkpoint <run>/model_best.pth.tar --copy-inliers
+#   → posmlv/outlier/<class>/…   (crops to review / drop)
+#   → posmlv/outlier/outlier.txt (CSV audit: classtype/file, bad_dist, nearest_type, nearest_dist)
+#   → posmlv/inlier/inlier.txt   (CSV: classtype/file, distance)
+#   → posmlv/inlier/<class>/…    (clean crops → train the next classifier here)
+```
+
+Notes:
+- Both folders are **copies** (`shutil.copy2`); `train/` is never modified, so it's safe to re-run.
+  Re-running overwrites same-named files rather than clearing the folder — delete `inlier/` first if
+  you change the threshold and want a fresh set.
+- Inlier/outlier membership uses the **clean** prototype distance (the same gate used for the robust
+  mean), not the augmented threshold distances — it reflects "close to its own class on clean
+  preprocessing," independent of `--quantile` / `--aug`.
+- This is a **bootstrap loop**: train a first classifier → run `--copy-inliers` to clean the data →
+  retrain on `inlier/` for a stronger model → optionally repeat.
 
 ---
 
