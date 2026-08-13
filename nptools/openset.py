@@ -771,11 +771,20 @@ def main():
         session = load_openset_onnx(args.load_onnx, use_gpu=args.gpu_predict)
         img_paths = [args.image] if args.image else _scan_eval_images(args.data_dir)
         print(f'  prediction via ONNX model')
+        n_correct = 0
         for img_path in img_paths:
             label, dist, nearest = predict_onnx(session, transform, class_names, img_path,
                                                 no_argmin=no_argmin)
+            expected = Path(img_path).parent.name     # class subfolder under val/ or test/
+            ok = (label == expected)
+            n_correct += ok
+            marker = '' if ok else '  ✗'
             print(f'{_short_path(img_path, args.data_dir)}')
-            print(f'  → prediction: {label}  (nearest known: {nearest}, dist={dist:.4f})')
+            print(f'  expected: {expected}   detected: {label}   '
+                  f'nearest: {nearest} (dist={dist:.4f}){marker}')
+        if len(img_paths) > 1:
+            print(f'\nmatched {n_correct}/{len(img_paths)} '
+                  f'({n_correct / len(img_paths) * 100:.1f}%) against the folder label')
         return
 
     # --- PyTorch path ---
@@ -844,25 +853,20 @@ def main():
             model, transform, prototypes, class_names, thresholds, paths, predict_device,
             args.img_size)
 
+    # Report per image: expected class (val/test subfolder), detected type, and nearest distance.
+    n_correct = 0
     for img_path, (label, dist, nearest) in zip(img_paths, predict_many(img_paths)):
+        expected = Path(img_path).parent.name         # class subfolder under val/ or test/
+        ok = (label == expected)
+        n_correct += ok
+        marker = '' if ok else '  ✗'
         print(f'{_short_path(img_path, args.data_dir)}')
-        print(f'  → prediction: {label}  (nearest: {nearest}, dist={dist:.4f})')
+        print(f'  expected: {expected}   detected: {label}   '
+              f'nearest: {nearest} (dist={dist:.4f}){marker}')
+    if len(img_paths) > 1:
+        print(f'\nmatched {n_correct}/{len(img_paths)} '
+              f'({n_correct / len(img_paths) * 100:.1f}%) against the folder label')
 
-    # Predict on outlier folder (outliers flagged during prototype building).
-    outlier_root = Path(args.data_dir) / 'outlier'
-    if outlier_root.exists():
-        outlier_imgs = sorted(
-            p for p in outlier_root.rglob('*')
-            if p.is_file() and p.suffix.lower() in _IMG_EXTS
-        )
-        if outlier_imgs:
-            print(f'\n--- outlier predictions ({len(outlier_imgs)} files) ---')
-            for p, (label, dist, nearest) in zip(outlier_imgs,
-                                                 predict_many([str(x) for x in outlier_imgs])):
-                true_cls = p.parent.name          # folder name = original class
-                marker = '' if label == true_cls else f'  ← expected {true_cls}'
-                print(f'{_short_path(p, args.data_dir)}')
-                print(f'  → {label}  (nearest: {nearest}, dist={dist:.4f}){marker}')
 
 def dump_layer():
     model = onnx.load('nptools/model_openset.onnx')

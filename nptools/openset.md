@@ -96,8 +96,18 @@ Notes:
   read, so `others`/unknown is never augmented.
 - Prototype building is **parallelized** (DataLoader workers + batched GPU inference) and prints
   its **elapsed time**.
-- **Prediction source:** with `--image` it's that one image; otherwise it scans **both** `val/`
-  and `test/` under `--data-dir`.
+- **Prediction source:** with `--image` it's that one image; otherwise it scans **only** the `val/`
+  and `test/` folders under `--data-dir` (the `outlier/`/`inlier/` folders are **not** predicted).
+- **Prediction report:** each image is expected to live under a class subfolder (`val/<class>/…`),
+  so for every image it prints the **expected** class (that subfolder name), the **detected** type
+  (the open-set label — a known class or `unknown`), and the **nearest** known class with its cosine
+  distance; a `✗` marks a mismatch. A final line reports the match rate against the folder labels:
+  ```
+  test/Other Drinks/CBKZ_20260806_770_0013.jpg
+    expected: Other Drinks   detected: unknown   nearest: Pepsi (dist=0.5210)  ✗
+
+  matched 812/900 (90.2%) against the folder label
+  ```
 - **Prediction device & speed:** prediction/verification runs on **CPU by default** so it mirrors the
   ncnn deployment target (the ONNX session uses `CPUExecutionProvider`; the TorchScript/in-memory
   model runs on CPU). Pass **`--gpu-predict`** to run it on the GPU instead (ONNX
