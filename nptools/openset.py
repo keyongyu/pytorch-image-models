@@ -21,6 +21,14 @@ import cv2
 from timm.models import load_checkpoint
 from torchvision import transforms
 
+try:
+    # Optional: shell tab-completion of main()'s flags. Note the shell hook has to be registered
+    # against `uv`, not this file: completions are keyed on the FIRST token of the command line,
+    # and this script is invoked as `uv run python nptools/openset.py ...`.
+    import argcomplete
+except ImportError:
+    argcomplete = None
+
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
 MODEL_NAME = 'tf_efficientnet_lite0.in1k'
@@ -1101,6 +1109,9 @@ def main():
                              'in-memory model on cuda). Default CPU, which mirrors the ncnn deployment '
                              'target. Note: only the in-memory PyTorch path decodes in batches; the '
                              'ONNX and TorchScript paths run one image at a time')
+    # Tab-completion hook: with _ARGCOMPLETE set this prints the candidate flags and exits.
+    if argcomplete is not None:
+        argcomplete.autocomplete(parser)
     args = parser.parse_args()
 
     # --img-size defaults lazily so --load-onnx can tell "user asked for N" from "user said nothing"

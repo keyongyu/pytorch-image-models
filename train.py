@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# PYTHON_ARGCOMPLETE_OK
 """ ImageNet Training Script
 
 This is intended to be a lean and easily modifiable ImageNet training script that reproduces ImageNet
@@ -31,6 +32,13 @@ import torch
 import torch.nn as nn
 import torchvision.utils
 import yaml
+
+try:
+    # Optional: shell tab-completion of the flags below. Register once per shell, e.g.
+    #   register-python-argcomplete --shell fish train.py > ~/.config/fish/completions/train.py.fish
+    import argcomplete
+except ImportError:
+    argcomplete = None
 
 from timm import utils
 from timm.data import create_dataset, create_loader, create_naflex_loader, resolve_data_config, \
@@ -482,6 +490,11 @@ parser.add_argument('--kd-token-distill-type', default='soft', type=str, choices
 
 
 def _parse_args():
+    # Tab-completion hook: when the shell invokes us with _ARGCOMPLETE set, this emits the
+    # candidate flags and exits; a normal run falls through untouched.
+    if argcomplete is not None:
+        argcomplete.autocomplete(parser)
+
     # Do we have a config file to parse?
     args_config, remaining = config_parser.parse_known_args()
     if args_config.config:
