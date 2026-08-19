@@ -426,9 +426,14 @@ def build_prototypes(model, transform, device: str, data_dir: str, img_size: int
     """Compute an L2-normalized mean feature per class from the training split.
 
     Only the classes listed in `class_map_names` are used, in that order (folders not in the
-    class-map are ignored). A class-map entry whose folder is missing or has no images is warned
-    about and skipped. Parallelized: decode across `num_workers` workers, backbone on batches.
-    `class_names` (return) stays aligned with the prototype matrix used for export/inference.
+    class-map are ignored). Parallelized: decode across `num_workers` workers, backbone on batches.
+
+    Returns one prototype per class-map entry, so `class_names` == `class_map_names` and a class
+    index means the same thing everywhere (class-map file, exported matrix, client). A class-map
+    entry with no usable images -- folder missing, folder empty, or every image an outlier -- is
+    warned about and gets a ZERO prototype, which always scores the maximum cosine distance (1.0)
+    and is therefore always rejected. See the comment at the assignment for why zero is the correct
+    sentinel and not just a convenient one.
 
     Every class gets the SAME reject threshold (`threshold`). Per-class thresholds taken from each
     class's own training spread were removed: with one video per class the training crops are
@@ -523,8 +528,32 @@ def build_prototypes(model, transform, device: str, data_dir: str, img_size: int
         dists = 1.0 - (feats @ proto)                        # reported only; not used for the thr
         print(f'{cls:12s}: {len(feats):4d} imgs, mean={dists.mean():.4f}, max={dists.max():.4f}')
 
-    # keep class_names aligned with classes that produced a prototype
-    class_names = [c for c in class_names if c in prototypes]
+    # Keep ONE prototype per class-map entry, in class-map order, so a class index means the same
+    # thing in the class-map file, the exported matrix and the client. Dropping data-less classes
+    # instead (as this used to) silently shifts every index after the first gap, which is
+    # unrecoverable on the client side -- it only has the class-map file to index with.
+    #
+    # A class with no data gets a ZERO prototype, which is the correct sentinel rather than merely a
+    # convenient one: the pre-logits feature is post-ReLU6 and therefore non-negative, so cosine
+    # similarity lies in [0, 1] and cosine distance in [0, 1]. A zero row scores sims = 0, i.e.
+    # dist == 1.0, the MAXIMUM attainable distance -- so it can never strictly win the argmin
+    # against a class that has data, and if it ever tied at 1.0 the margin (1.0 - threshold) is
+    # positive, i.e. the verdict is 'unknown' anyway. Note F.normalize() is deliberately NOT applied
+    # here; normalizing a zero vector is NaN, which would poison argmin instead of losing it.
+    missing = [c for c in class_map_names if c not in prototypes]
+    if missing:
+        if not prototypes:
+            raise RuntimeError(
+                f'no class produced a prototype ({len(class_map_names)} class-map entries, all '
+                f'without usable images under {data_dir}/train) -- cannot infer the feature '
+                f'dimension for placeholders, and an all-placeholder model would reject everything')
+        dim = next(iter(prototypes.values())).shape[0]
+        proto_dtype = next(iter(prototypes.values())).dtype
+        for cls in missing:
+            prototypes[cls] = torch.zeros(dim, dtype=proto_dtype)
+        print(f'{len(missing)} class(es) without usable images get a zero prototype '
+              f'(distance always 1.0 -> always rejected): {", ".join(missing)}')
+    class_names = list(class_map_names)
     if outlier_rows:
         csv_path = outlier_root / 'outlier.txt'
         _write_aligned_csv(
@@ -534,8 +563,9 @@ def build_prototypes(model, transform, device: str, data_dir: str, img_size: int
         print(f'inliers copied: {n_inliers_copied} images → {_short_path(inlier_root, data_dir)}')
         if inlier_rows:
             _write_aligned_csv(inlier_root / 'inlier.txt', ('classtype/file', 'distance'), inlier_rows)
-    print(f'build_prototypes: {len(class_names)} classes, {len(samples)} images, '
-          f'constant threshold={threshold:.4f}, in {time.time() - t_start:.1f}s')
+    print(f'build_prototypes: {len(class_names)} classes '
+          f'({len(class_names) - len(missing)} with data + {len(missing)} placeholder), '
+          f'{len(samples)} images, constant threshold={threshold:.4f}, in {time.time() - t_start:.1f}s')
     return prototypes, class_names
 
 
@@ -1173,6 +1203,13 @@ def main():
         threshold=threshold, copy_inliers=args.copy_inliers, feats=feats,
         min_threshold=args.min_threshold)
     print(f'\nConstant threshold {threshold:.4f} applied to {len(class_names)} classes\n')
+
+    # Placeholder classes are exported like any other (index alignment is the point), so name them
+    # in the sidecar -- otherwise a client has no way to tell "this class has no training data" from
+    # a real class that simply never matches.
+    empty_classes = [c for c in class_names if not bool(prototypes[c].any())]
+    if empty_classes:
+        meta_extra['empty_classes'] = empty_classes
 
     onnx_path = pt_path = None
     if args.export_onnx is not None:
