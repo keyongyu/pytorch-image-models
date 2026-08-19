@@ -12,6 +12,12 @@ export OMP_NUM_THREADS=1
 DATA_DIR=/home/keyong/cls2/code/posmlv
 OUTPUT_DIR=""
 CLASS_MAP=""
+# ON by default: the open-set pipeline (nptools/openset.py) needs ArcFace embeddings to build
+# usable prototypes, and per-class accuracy is how look-alike classes get spotted. train.py
+# declares both as plain store_true with no --no- counterpart, so switching them off means not
+# emitting the flag at all -- hence the wrapper owns it, via --no-arcface / --no-per-class-acc.
+ARCFACE=1
+PER_CLASS_ACC=1
 
  # Consume script-level flags here (not forwarded to train.py); anything else is
  # collected in EXTRA_ARGS and passed through. Must run BEFORE `set --` below
@@ -21,6 +27,8 @@ CLASS_MAP=""
  #   --data-dir  PATH   dataset root        (default: $DATA_DIR)
  #   --output-dir PATH  output/checkpoints  (default: $DATA_DIR/output)
  #   --class-map PATH   class-map file      (default: $DATA_DIR/class_84.txt)
+ #   --no-arcface       disable --arcface        (on by default)
+ #   --no-per-class-acc disable --per-class-acc  (on by default)
  usage() {
      cat <<EOF
 Usage: sh $0 [options] [-- train.py args...]
@@ -36,15 +44,20 @@ Options:
   --test-npaug-dir PATH  DRY-RUN: no training; dump augmented images (grouped by class)
                      to PATH for <=4 epochs to visually test nptools/npaug.py.
   --test-npaug-class CLS  Restrict that dry-run to class folder(s) only (comma-separated).
+  --no-arcface       Disable --arcface        (ON by default; needed by nptools/openset.py).
+  --no-per-class-acc Disable --per-class-acc  (ON by default).
   -h, --help         Show this help and exit.
 
 --num-classes is derived automatically from the class-map (non-empty line count).
+--arcface and --per-class-acc are passed to train.py by DEFAULT; pass them explicitly if you
+like (it changes nothing), or use the --no- forms above to turn them off.
 Both "--flag value" and "--flag=value" forms are accepted.
 
 Examples:
   sh $0
   sh $0 --new
-  sh $0 --data-dir /path/to/ds --class-map /path/to/ds/classes.txt --per-class-acc --arcface
+  sh $0 --data-dir /path/to/ds --class-map /path/to/ds/classes.txt   # arcface on by default
+  sh $0 --no-arcface --no-per-class-acc                              # plain softmax run
   sh $0 --test-npaug-dir /tmp/aug_check --test-npaug-class posm_18   # aug dry-run, posm_18 only
 EOF
  }
@@ -67,6 +80,12 @@ EOF
          --test-npaug-dir=*)   TEST_NPAUG_DIR="${1#*=}" ;;
          --test-npaug-class)   TEST_NPAUG_CLASS="$2"; shift ;;
          --test-npaug-class=*) TEST_NPAUG_CLASS="${1#*=}" ;;
+         # Consumed, not forwarded, so passing --arcface explicitly cannot emit it twice.
+         # ("--arcface-s"/"--arcface-m" take values and fall through to EXTRA_ARGS below.)
+         --arcface)            ARCFACE=1 ;;
+         --no-arcface)         ARCFACE=0 ;;
+         --per-class-acc)      PER_CLASS_ACC=1 ;;
+         --no-per-class-acc)   PER_CLASS_ACC=0 ;;
          *)              EXTRA_ARGS="$EXTRA_ARGS $1" ;;
      esac
      shift
@@ -78,6 +97,11 @@ EOF
 
  # Derive --num-classes from the class-map (count non-empty lines) instead of hardcoding.
 NUM_CLASSES=$(grep -cve '^[[:space:]]*$' "${CLASS_MAP}")
+
+ # Both are store_true in train.py, so "off" means omitting the flag entirely.
+ARCFACE_FLAGS=""
+[ "$ARCFACE" = "1" ]       && ARCFACE_FLAGS="--arcface"
+[ "$PER_CLASS_ACC" = "1" ] && ARCFACE_FLAGS="${ARCFACE_FLAGS} --per-class-acc"
 
  if [ "${DEBUGPY:-0}" = "1" ]; then
      set -- -m debugpy \
@@ -128,6 +152,7 @@ fi
      --num-classes="${NUM_CLASSES}" \
      ${TEST_NPAUG_DIR:+--test-npaug-dir="${TEST_NPAUG_DIR}"} \
      ${TEST_NPAUG_CLASS:+--test-npaug-class="${TEST_NPAUG_CLASS}"} \
+     ${ARCFACE_FLAGS} \
      ${RESUME_OR_NEW} \
      ${EXTRA_ARGS}
      #--bg-dir="${DATA_DIR}/bg_photos" \

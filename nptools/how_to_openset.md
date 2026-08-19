@@ -21,7 +21,7 @@ own docs for depth:
  train_posm.sh   (ArcFace; --nobg bg-swap)   ─►  checkpoint   ◄─ needs: class map, bg photos (NOBG_BG_DIR)
       │
       ▼
- openset.py   (prototypes + per-class thresholds)   ─►  .pt / .onnx (+ meta.json)   ◄─ needs: class map
+ openset.py   (prototypes + calibrated threshold)   ─►  .pt / .onnx (+ meta.json)   ◄─ needs: class map
       │
       ▼
  pnnx   ─►  .ncnn.param / .ncnn.bin
@@ -79,11 +79,12 @@ Repeat step 2 for every product/class. Tuning (`--margin`, QC thresholds, etc.) 
 - **Softmax classification:** add an explicit `others` / background class so the network has a place
   to send unknowns (the classic background-class approach to open-set with softmax). There it earns
   its keep.
-- **ArcFace open-set (this pipeline):** **no longer recommended.** Reject is decided by per-class
-  **cosine-distance thresholds** calibrated on in-distribution (augmented) data (step 8), so unknowns
-  are handled *geometrically* by distance-to-prototype — an `others` bucket is not needed for the
-  decision. And you must not train it as a class anyway: `others` is heterogeneous and fights
-  ArcFace's compactness objective, so a single `others` prototype is meaningless.
+- **ArcFace open-set (this pipeline):** **no longer recommended.** Reject is decided by a single
+  **cosine-distance threshold** measured against leave-one-class-out negatives drawn from your own
+  labelled data (step 8), so unknowns are handled by distance-to-prototype — an `others` bucket is
+  not needed for the decision, and calibration does not need one either. You must not train it as a
+  class anyway: `others` is heterogeneous and fights ArcFace's compactness objective, so a single
+  `others` prototype is meaningless.
 
 If you already have an `others/` folder (e.g. for evaluation), it does no harm as long as you **keep
 it out of the class-map** — the reader drops folders not in the map, and `openset.py` builds
@@ -149,7 +150,8 @@ python -m nptools.reduce_imbalance --data-dir <DATA> --split train
 ## 7. Train the ArcFace classifier
 
 `train_posm.sh` wraps `train.py` with the posm defaults (`--nobg` bg-swap, `--crop-mode=squash`,
-`tf_efficientnet_lite0`, etc.). Add `--arcface` for open-set-friendly embeddings:
+`tf_efficientnet_lite0`, etc.). It also passes **`--arcface --per-class-acc` by default**, since
+the open-set pipeline needs ArcFace embeddings:
 
 **Background folder (required for `--nobg`).** The bg-swap composites each `nobg_*.png` cutout onto a
 random photo from a **background-image folder** every epoch — this is what breaks the shared-video
@@ -168,13 +170,16 @@ product images.
 sh nptools/train_posm.sh \
     --data-dir <DATA> \
     --class-map <DATA>/class_84.txt \
-    --new \                       # fresh from pretrained backbone (omit to resume last.pth.tar)
-    --arcface --per-class-acc     # forwarded through to train.py
+    --new                         # fresh from pretrained backbone (omit to resume last.pth.tar)
+                                  # --arcface --per-class-acc are added automatically
 ```
 
-- `--arcface` trains a normalized-feature / angular-margin head → **compact, well-separated
-  clusters** (tune with `--arcface-s`, `--arcface-m`). The saved checkpoint is a plain timm
-  `state_dict`; the ArcFace head is training-only.
+- **`--arcface` is on by default** — a normalized-feature / angular-margin head giving **compact,
+  well-separated clusters**, which is what makes the prototypes in step 8 usable (tune with
+  `--arcface-s`, `--arcface-m`; those still pass straight through). The saved checkpoint is a plain
+  timm `state_dict`; the ArcFace head is training-only. Turn it off with `--no-arcface`.
+- **`--per-class-acc` is on by default** too — per-class top-1, which is how look-alike classes get
+  spotted. Turn it off with `--no-per-class-acc`.
 - `--new` starts from the pretrained backbone; without it the script resumes the latest
   `last.pth.tar` under the output dir.
 - Checkpoints land in `<DATA>/output/<timestamp>/`; use `model_best.pth.tar` next.
@@ -184,29 +189,40 @@ sh nptools/train_posm.sh \
 ## 8. Build & export the open-set model
 
 `openset.py` loads the checkpoint, builds an L2-normalized **prototype** (mean pre-logits feature)
-per class, computes a **per-class reject threshold**, and exports a deployable model.
+per class, resolves a **single constant reject threshold** shared by every class, and exports a
+deployable model.
 
 ```bash
+# optional first: inspect the false-reject / false-accept tradeoff without exporting
+uv run python nptools/openset.py \
+    --data-dir <DATA> --class-map <DATA>/class_84.txt \
+    --ck <DATA>/output/<run>/model_best.pth.tar --calibrate
+
+# export (the threshold is calibrated automatically -- there is nothing to pass)
 uv run python nptools/openset.py \
     --data-dir <DATA> \
     --class-map <DATA>/class_84.txt \
     --ck <DATA>/output/<run>/model_best.pth.tar \
-    --quantile 0.97 \             # per-class threshold quantile (default)
-    --aug \                       # calibrate thresholds on npaug-augmented distances (default on)
     --no-argmin --export-pt nptools/openset.pt   # stock-ncnn-friendly export (or --export-onnx)
 ```
 
 What happens:
 - **Prototypes** come from clean `train/<class>/` images (class-map only; `others` never read).
-- **Thresholds** = the `--quantile` of each class's in-distribution distances; with `--aug` those
-  distances are measured on npaug-augmented views (prototype stays clean), so the threshold reflects
-  real-world variation instead of the optimistic clean-train spread.
-- Export writes `openset.pt` (or `.onnx`) **plus** `openset.pt.meta.json` (class order, per-class
-  thresholds, img_size, mean/std). After export it **self-verifies** by predicting through the
-  exported model.
+- **One constant threshold** is applied to every class. Per-class thresholds were removed after
+  measurement: they overfit 3.8× worse on held-out data, and the old quantile values were tight
+  enough to falsely reject ~13–15% of real product images.
+- **The threshold is always calibrated** during the run, sharing the feature pass with prototype
+  building — it cannot be pinned, so it can never go stale against the checkpoint. Negatives come
+  from leave-one-class-out on your own labelled data, so no curated negative set is required. It is
+  seeded, so the same checkpoint always exports the same artifact. A floor applies
+  (`--min-threshold`, default 0.2); a suggestion below it is clamped up and warns, since that
+  indicates a data problem rather than a genuinely tiny threshold.
+- Export writes `openset.pt` (or `.onnx`) **plus** `openset.pt.meta.json` (class order, the scalar
+  threshold, img_size, mean/std, resize filter, and the measured FRR/FAR that justified the
+  value). After export it **self-verifies** by predicting through the exported model.
 
-Threshold theory, per-class vs global, `others`-as-negatives, and ncnn conversion are all in
-[`openset.md`](openset.md).
+Why one threshold rather than per-class, how calibration works, the client's preprocessing contract,
+and ncnn conversion are all in [`openset.md`](openset.md).
 
 ---
 
@@ -240,10 +256,11 @@ Full ncnn client code and the custom-layer route are in [`openset.md`](openset.m
 uv run python nptools/openset.py --load-onnx nptools/openset.onnx --image sample.jpg
 ```
 
-Decision at inference: nearest prototype by cosine distance; if `dist > threshold[that class]` →
-**unknown / new product**, else the matched class. Sanity-check that real products in `val/`/`test/`
-are accepted; if you kept an `others/` set (step 3), confirm its items are rejected. Adjust
-`--quantile` if needed and re-export.
+Decision at inference: nearest prototype by cosine distance; if `dist > threshold` → **unknown /
+new product**, else the matched class. Sanity-check that real products in `val/`/`test/` are
+accepted; if you kept an `others/` set (step 3), confirm its items are rejected. Re-run
+`--calibrate` to inspect the tradeoff; every export recalibrates, so re-exporting is how you pick
+up a corrected value after fixing data.
 
 ---
 
@@ -254,8 +271,10 @@ The ArcFace embedding generalizes, so adding a product usually needs **no retrai
 2. add its name to the class-map (step 4),
 3. rebuild/export prototypes (step 8).
 
-The new class gets a prototype + threshold from a handful of images; retrain the backbone only if
-accuracy on the new class is poor.
+The new class gets a prototype from a handful of images and inherits the shared threshold; retrain
+the backbone only if accuracy on the new class is poor. Re-running `--calibrate` after enrolling is
+cheap and worthwhile — leave-one-class-out is exactly the "a product I have not enrolled yet"
+scenario, so it measures the case this step creates.
 
 ---
 
@@ -268,10 +287,11 @@ uv run python nptools/extract_object.py --video-folder <DATA>/<class>videos --de
 # 6. reduce class imbalance (symlink-oversample minority classes)
 python -m nptools.reduce_imbalance --data-dir <DATA> --split train
 # 7. train ArcFace
-sh nptools/train_posm.sh --data-dir <DATA> --class-map <DATA>/class_84.txt --new --arcface
-# 8. build + export open-set model
+sh nptools/train_posm.sh --data-dir <DATA> --class-map <DATA>/class_84.txt --new   # arcface on by default
+# 8. build + export open-set model (threshold is calibrated automatically)
 uv run python nptools/openset.py --data-dir <DATA> --class-map <DATA>/class_84.txt \
-    --ck <DATA>/output/<run>/model_best.pth.tar --no-argmin --export-pt nptools/openset.pt
+    --ck <DATA>/output/<run>/model_best.pth.tar \
+    --no-argmin --export-pt nptools/openset.pt
 # 9. convert to ncnn
 cd nptools && pnnx openset.pt inputshape=[1,3,224,224]      # → openset.ncnn.param + .bin
 ```

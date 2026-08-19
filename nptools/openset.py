@@ -17,8 +17,8 @@ import torch.nn.functional as F
 import timm
 import onnxruntime as ort
 import onnx
+import cv2
 from timm.models import load_checkpoint
-from PIL import Image
 from torchvision import transforms
 
 
@@ -26,6 +26,18 @@ _HERE = os.path.dirname(os.path.abspath(__file__))
 MODEL_NAME = 'tf_efficientnet_lite0.in1k'
 MEAN = (0.5, 0.5, 0.5)
 STD = (0.5, 0.5, 0.5)
+# Downscale filter the CLIENT must use. Part of the preprocessing contract, like MEAN/STD: an
+# aliasing filter shifts features silently. cv2's default (INTER_LINEAR) reads only ~2% of source
+# pixels on a large reduction and does NOT anti-alias -- clients must pass INTER_AREA explicitly.
+# `load_image_uint8` below uses exactly this filter, so prototypes are built on the same
+# preprocessing the client runs rather than something merely equivalent to it.
+RESIZE_FILTER = 'area'
+# Default floor on the reject threshold, overridable with --min-threshold. A small threshold
+# rejects genuine product images: measured on posmlv, 0.02 costs 10% false-reject and 0.007 costs
+# 50%, while buying almost nothing in false-accept (which stays under 0.2% across that whole
+# range). Calibration is clamped up to the floor and warns when the clamp binds -- a suggestion
+# below it means the data is wrong, not that the threshold should be tiny.
+DEFAULT_MIN_THRESHOLD = 0.2
 
 # defaults for the CLI args (--data-dir / --img-size)
 _DEFAULT_DATA_DIR = os.path.join(_HERE, '..', 'posmlv')
@@ -84,29 +96,47 @@ def _scan_eval_images(data_dir: str) -> list:
     return paths
 
 
-def build_transform(img_size: int, mean=MEAN, std=STD) -> transforms.Compose:
-    # matches inference: squash (resize whole image to square) + normalize
-    return transforms.Compose([
-        transforms.Resize((img_size, img_size), interpolation=transforms.InterpolationMode.BICUBIC),
-        transforms.ToTensor(),
-        transforms.Normalize(mean=mean, std=std),
-    ])
+def load_image_uint8(path: str, img_size: int) -> np.ndarray:
+    """Decode and squash-resize one image to (img_size, img_size); returns HWC uint8 RGB.
+
+    The single decode primitive for this module. OpenCV + INTER_AREA is used deliberately: the ncnn
+    client decodes with OpenCV too, so prototypes are built on exactly the deployment
+    preprocessing rather than something merely equivalent to it.
+
+    INTER_AREA is not interchangeable with cv2's default. `INTER_LINEAR`/`INTER_CUBIC` use a fixed
+    2x2/4x4 kernel regardless of scale, so on a large downscale they read ~2-3% of the source and
+    alias; INTER_AREA reads 100%. See RESIZE_FILTER and openset.md section 5.
+    """
+    bgr = cv2.imread(path, cv2.IMREAD_COLOR)          # 3-channel; alpha dropped, as PIL convert('RGB') did
+    if bgr is None:
+        raise OSError(f'could not decode image: {path}')
+    bgr = cv2.resize(bgr, (img_size, img_size), interpolation=cv2.INTER_AREA)   # squash, not letterbox
+    return cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
 
 
-def _build_raw_transform(img_size: int) -> transforms.Compose:
-    """Resize + ToTensor only (no normalize) — used for the GPU aug pass."""
-    return transforms.Compose([
-        transforms.Resize((img_size, img_size), interpolation=transforms.InterpolationMode.BICUBIC),
-        transforms.ToTensor(),
-    ])
+def build_transform(img_size: int, mean=MEAN, std=STD):
+    """Return ``fn(path) -> [3, H, W] float32`` normalized tensor, for single-image paths.
+
+    Takes a PATH rather than a PIL image: decoding is part of the preprocessing contract (see
+    `load_image_uint8`), so it belongs inside the transform rather than at each call site.
+    """
+    mean_t = torch.tensor(mean, dtype=torch.float32).view(3, 1, 1)
+    std_t = torch.tensor(std, dtype=torch.float32).view(3, 1, 1)
+
+    def _tf(path: str) -> torch.Tensor:
+        arr = load_image_uint8(path, img_size)
+        t = torch.from_numpy(arr).permute(2, 0, 1).float().div_(255.0)
+        return (t - mean_t) / std_t
+
+    return _tf
 
 
 class _NpAugTransform:
     """npaug (build_aug_pipeline) augmentation -> normalized tensor, for threshold calibration.
 
-    Used only to widen the in-distribution distance spread so per-class reject thresholds reflect
-    real-world variation (lighting/blur/geometry) instead of the optimistic clean-train spread.
-    The prototype itself is still built from clean images.
+    Used during calibration so the in-distribution distance spread reflects real-world variation
+    (lighting/blur/geometry) instead of the optimistic near-duplicate video frames. The prototype
+    itself is still built from clean images.
     """
 
     def __init__(self, img_size: int):
@@ -114,8 +144,13 @@ class _NpAugTransform:
         self.aug = build_aug_pipeline(img_size=img_size)     # ends with Resize -> (img_size, img_size)
         self.norm = transforms.Normalize(mean=MEAN, std=STD)
 
-    def __call__(self, pil_rgb):
-        out = self.aug(image=np.array(pil_rgb))['image']     # HWC uint8 RGB
+    def __call__(self, path: str):
+        # Decoded at FULL size, not via load_image_uint8: the npaug pipeline runs its geometric
+        # transforms before its own internal Resize, so pre-shrinking here would change them.
+        bgr = cv2.imread(path, cv2.IMREAD_COLOR)
+        if bgr is None:
+            raise OSError(f'could not decode image: {path}')
+        out = self.aug(image=cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB))['image']   # HWC uint8 RGB
         t = torch.from_numpy(np.ascontiguousarray(out)).permute(2, 0, 1).float().div_(255.0)
         return self.norm(t)
 
@@ -151,8 +186,7 @@ class _GpuAugBatch(torch.nn.Module):
 
 @torch.no_grad()
 def extract_feature(model: torch.nn.Module, transform, img_path: str, device: str) -> torch.Tensor:
-    img = Image.open(img_path).convert('RGB')
-    x = transform(img).unsqueeze(0).to(device)
+    x = transform(img_path).unsqueeze(0).to(device)
     feat = model.forward_head(model.forward_features(x), pre_logits=True)  # [1, 1280]
     return F.normalize(feat, dim=1).squeeze(0).cpu()  # L2-normalized [1280]
 
@@ -160,17 +194,51 @@ def extract_feature(model: torch.nn.Module, transform, img_path: str, device: st
 _IMG_EXTS = ('.jpg', '.jpeg', '.png', '.bmp', '.webp')
 
 
-class _FeatDataset(torch.utils.data.Dataset):
-    """Yield (transformed_image, class_idx) for prototype feature extraction.
+def _worker_resize_uint8(img_size: int):
+    """Return ``fn(path) -> [3, H, W] uint8`` tensor, for the bulk extraction path.
 
-    Loading + transform run in DataLoader worker processes (parallel decode). Unreadable images
-    return a zero tensor with class_idx = -1 so the batch loop can skip them without crashing.
+    Stops before the float conversion and normalize so the worker hands back **uint8**: each
+    3x224x224 sample is then 150 KB instead of 602 KB crossing the worker->main boundary.
+    `_gpu_normalize` finishes the job on-device, so the result matches `build_transform(img_size)`
+    exactly — both go through `load_image_uint8`, so there is one decode path, not two.
+    """
+    def _tf(path: str) -> torch.Tensor:
+        return torch.from_numpy(load_image_uint8(path, img_size)).permute(2, 0, 1)
+
+    return _tf
+
+
+_GPU_NORM_CACHE: dict = {}
+
+
+def _gpu_normalize(x: torch.Tensor) -> torch.Tensor:
+    """(x/255 - MEAN) / STD on-device. `x` is float in [0, 1]; mean/std tensors are cached."""
+    key = (x.device, x.dtype)
+    if key not in _GPU_NORM_CACHE:
+        _GPU_NORM_CACHE[key] = (
+            torch.tensor(MEAN, device=x.device, dtype=x.dtype).view(1, 3, 1, 1),
+            torch.tensor(STD, device=x.device, dtype=x.dtype).view(1, 3, 1, 1),
+        )
+    mean, std = _GPU_NORM_CACHE[key]
+    return (x - mean) / std
+
+
+class _FeatDataset(torch.utils.data.Dataset):
+    """Yield (image_tensor, class_idx) for prototype feature extraction.
+
+    `transform` is a ``fn(path) -> [3, H, W] tensor``; decode runs inside it, in the DataLoader
+    worker processes. Unreadable images return a zero tensor with class_idx = -1 so the batch loop
+    can skip them without crashing.
+
+    `out_dtype` must match what `transform` returns, so the zero tensor for an unreadable image
+    collates with the rest of its batch instead of raising a dtype mismatch.
     """
 
-    def __init__(self, samples, transform, img_size):
+    def __init__(self, samples, transform, img_size, out_dtype=torch.uint8):
         self.samples = samples          # list of (path, class_idx)
         self.transform = transform
         self.img_size = img_size
+        self.out_dtype = out_dtype
 
     def __len__(self):
         return len(self.samples)
@@ -178,10 +246,9 @@ class _FeatDataset(torch.utils.data.Dataset):
     def __getitem__(self, i):
         path, cls = self.samples[i]
         try:
-            img = Image.open(path).convert('RGB')
-            return self.transform(img), cls
-        except (IOError, OSError):
-            return torch.zeros(3, self.img_size, self.img_size), -1
+            return self.transform(path), cls
+        except (IOError, OSError, cv2.error):
+            return torch.zeros(3, self.img_size, self.img_size, dtype=self.out_dtype), -1
 
 
 def _worker_init(worker_id: int) -> None:
@@ -190,6 +257,12 @@ def _worker_init(worker_id: int) -> None:
         cv2.setNumThreads(1)
     except ImportError:
         pass
+    # npaug/albumentations draw from the python and numpy RNGs, which DataLoader does not seed for
+    # us. Derive both from torch's per-worker seed so --cpu-aug is reproducible too.
+    import random as _random
+    seed = torch.initial_seed() % (2 ** 32)
+    _random.seed(seed)
+    np.random.seed(seed)
 
 
 def _nearest_other_class(feat: torch.Tensor, own_cls: str, proto_mat, proto_names):
@@ -214,24 +287,13 @@ def _nearest_other_class(feat: torch.Tensor, own_cls: str, proto_mat, proto_name
     return proto_names[nn_idx], float(dists[nn_idx])
 
 
-def build_prototypes(model, transform, device: str, data_dir: str, img_size: int,
-                     class_map_names, batch_size: int = 64, num_workers: int = 8,
-                     threshold_quantile: float = 0.97, aug: bool = True, aug_views: int = 2,
-                     aug_max_per_class: int = 100, cpu_aug: bool = False, copy_inliers: bool = False):
-    """Compute an L2-normalized mean feature per class from the training split.
+def _collect_samples(train_root: str, class_map_names) -> tuple:
+    """Collect (class_names, samples) from `train_root`, following class-map order.
 
-    Only the classes listed in `class_map_names` are used, in that order (folders not in the
-    class-map are ignored). A class-map entry whose folder is missing or has no images is warned
-    about and skipped. Parallelized: decode across `num_workers` workers, backbone on batches.
-    `class_names` (return) stays aligned with the prototype matrix used for export/inference.
-
-    If `copy_inliers` is set, the good inlier crops (cosine dist <= OUTLIER_THR to their class
-    prototype) are copied into `<data_dir>/inlier/<class>/` for training a clean classifier.
+    Only class-map folders are used, in that order; folders not in the map are ignored. A missing
+    or empty folder is warned about and skipped, so `class_names` may be shorter than
+    `class_map_names`. `samples` is a flat list of (path, class_idx) indexing into `class_names`.
     """
-    t_start = time.time()
-    train_root = os.path.join(data_dir, 'train')
-
-    # collect (path, class_idx) following the class-map order (ignore non-map folders)
     class_names, samples = [], []
     for cls in class_map_names:
         cls_dir = os.path.join(train_root, cls)
@@ -244,7 +306,7 @@ def build_prototypes(model, transform, device: str, data_dir: str, img_size: int
             print(f'{cls:12s}: WARNING — folder exists but has no images — skipped')
             continue
         if len(imgs) < 10:
-            print(f'{cls:12s}: WARNING — only {len(imgs)} images (<10); prototype/threshold '
+            print(f'{cls:12s}: WARNING — only {len(imgs)} images (<10); prototype '
                   f'may be unreliable')
         idx = len(class_names)
         class_names.append(cls)
@@ -252,78 +314,142 @@ def build_prototypes(model, transform, device: str, data_dir: str, img_size: int
 
     if not class_names:
         raise RuntimeError(f'No class-map class had images under {train_root}')
+    return class_names, samples
 
+
+def _extract_features(model, transform, samples, n_classes: int, img_size: int, device: str,
+                      batch_size: int = 64, num_workers: int = 16, repeat: int = 1,
+                      gpu_aug: torch.nn.Module | None = None, track_paths: bool = False):
+    """Feature-extract `samples` with `transform`, grouped by class index.
+
+    `repeat` > 1 tiles the list so stochastic augmentation produces multiple independent views in
+    a single DataLoader pass. `gpu_aug`: optional _GpuAugBatch applied on-device before the
+    backbone. `track_paths`: if True, also return pbc (paths by class, parallel to fbc).
+
+    Dispatches on the dtype the worker hands back, so both pipelines share this loop:
+    - **uint8** (the fast bulk path, `_worker_resize_uint8`): scaled to [0,1] here, then either
+      normalized on-device or handed to `gpu_aug`, which normalizes itself.
+    - **float32** (`_NpAugTransform`): already scaled and normalized in the worker; passed through.
+    """
+    actual = samples * repeat if repeat > 1 else samples
+    # uint8 for the bulk cv2 loader, float32 for _NpAugTransform, which normalizes in the worker
+    out_dtype = torch.float32 if isinstance(transform, _NpAugTransform) else torch.uint8
+    loader = torch.utils.data.DataLoader(
+        _FeatDataset(actual, transform, img_size, out_dtype=out_dtype),
+        batch_size=batch_size, num_workers=num_workers,
+        pin_memory=(str(device) != 'cpu'),
+        worker_init_fn=_worker_init,
+    )
+    fbc = [[] for _ in range(n_classes)]
+    pbc = [[] for _ in range(n_classes)] if track_paths else None
+    path_iter = iter(p for p, _ in actual) if track_paths else None
+    with torch.inference_mode():
+        for x, cls in loader:
+            x = x.to(device, non_blocking=True)
+            if x.dtype == torch.uint8:
+                x = x.float().div_(255.0)
+                if gpu_aug is None:
+                    x = _gpu_normalize(x)
+            if gpu_aug is not None:
+                x = gpu_aug(x)
+            f = model.forward_head(model.forward_features(x), pre_logits=True)  # [B, 1280]
+            f = F.normalize(f, dim=1).cpu()
+            for fi, ci in zip(f, cls.tolist()):
+                path = next(path_iter) if track_paths else None
+                if ci >= 0:                               # skip unreadable (ci == -1)
+                    fbc[ci].append(fi)
+                    if pbc is not None:
+                        pbc[ci].append(path)
+    return (fbc, pbc) if track_paths else fbc
+
+
+def _aug_probe_features(model, samples, class_names, img_size: int, device: str, batch_size: int,
+                        num_workers: int, aug_views: int, aug_max_per_class: int, cpu_aug: bool,
+                        seed: int = 0):
+    """Augmented probe features per class, for realistic calibration distances.
+
+    Subsamples to `aug_max_per_class` per class, then takes `aug_views` stochastic views of each.
+    GPU mode (default): workers decode+resize, _GpuAugBatch runs on device — fast. CPU mode
+    (`cpu_aug`): npaug/albumentations in the workers — faithful to training augmentation, slower.
+    Prototypes are never built from these; only the probe distances are.
+
+    `seed` fixes both the subsample choice and the augmentation itself. That matters because with
+    `--threshold auto` the calibrated value is baked into the exported model: an unseeded RNG would
+    make the same checkpoint export a different deployed artifact on every run.
+    """
+    import random as _random
+    torch.manual_seed(seed)                    # GPU aug + the DataLoader's per-worker seeds
+    by_class: list[list] = [[] for _ in class_names]
+    for p, ci in samples:
+        by_class[ci].append((p, ci))
+    rng = _random.Random(seed)
+    chosen_all: list = []
+    for cls_samples in by_class:
+        cap = aug_max_per_class if aug_max_per_class > 0 else len(cls_samples)
+        chosen_all.extend(rng.sample(cls_samples, min(cap, len(cls_samples))))
+    views = max(1, aug_views)
+    backend = 'CPU npaug' if cpu_aug else 'GPU torchvision'
+    print(f'aug probe pass: {len(chosen_all)} images x {views} views = {len(chosen_all) * views} '
+          f'total (capped at {aug_max_per_class}/class, {backend})')
+    if cpu_aug:
+        return _extract_features(model, _NpAugTransform(img_size), chosen_all, len(class_names),
+                                 img_size, device, batch_size, num_workers, repeat=views)
+    gpu_aug = _GpuAugBatch(img_size).to(device).eval()
+    return _extract_features(model, _worker_resize_uint8(img_size), chosen_all, len(class_names),
+                             img_size, device, batch_size, num_workers, repeat=views,
+                             gpu_aug=gpu_aug)
+
+
+def extract_train_features(model, transform, device: str, data_dir: str, img_size: int,
+                           class_map_names, batch_size: int = 64, num_workers: int = 16) -> dict:
+    """One clean feature pass over ``<data_dir>/train/``, shareable by every consumer.
+
+    Prototype building and threshold calibration both need exactly this, so running it once and
+    passing the result to both (`feats=` on either) halves the work of a `--threshold auto` export.
+    """
+    class_names, samples = _collect_samples(os.path.join(data_dir, 'train'), class_map_names)
     model.eval()
+    # `transform` is accepted for signature symmetry but the bulk path uses the uint8 worker
+    # transform + `_gpu_normalize`, which reproduces build_transform(img_size) exactly while
+    # moving 4x less data across the worker boundary. Verified feature-identical to 1e-6.
+    feats_by_class, paths_by_class = _extract_features(
+        model, _worker_resize_uint8(img_size), samples, len(class_names), img_size, device,
+        batch_size=batch_size, num_workers=num_workers, track_paths=True)
+    return {'class_names': class_names, 'samples': samples,
+            'feats_by_class': feats_by_class, 'paths_by_class': paths_by_class}
 
-    def _extract(tf, sample_list=None, repeat: int = 1, gpu_aug: torch.nn.Module | None = None,
-                 track_paths: bool = False):
-        """Feature-extract samples with transform `tf`, grouped by class index.
 
-        sample_list defaults to all samples. repeat > 1 tiles the list so stochastic
-        augmentation produces multiple independent views in a single DataLoader pass.
-        gpu_aug: optional _GpuAugBatch module applied on-device before the backbone.
-        track_paths: if True, also return pbc (paths by class, parallel to fbc).
-        """
-        src = sample_list if sample_list is not None else samples
-        actual = src * repeat if repeat > 1 else src
-        loader = torch.utils.data.DataLoader(
-            _FeatDataset(actual, tf, img_size),
-            batch_size=batch_size, num_workers=num_workers,
-            pin_memory=(str(device) != 'cpu'),
-            worker_init_fn=_worker_init,
-        )
-        fbc = [[] for _ in class_names]
-        pbc = [[] for _ in class_names] if track_paths else None
-        path_iter = iter(p for p, _ in actual) if track_paths else None
-        with torch.inference_mode():
-            for x, cls in loader:
-                x = x.to(device, non_blocking=True)
-                if gpu_aug is not None:
-                    x = gpu_aug(x)
-                f = model.forward_head(model.forward_features(x), pre_logits=True)  # [B, 1280]
-                f = F.normalize(f, dim=1).cpu()
-                for fi, ci in zip(f, cls.tolist()):
-                    path = next(path_iter) if track_paths else None
-                    if ci >= 0:                               # skip unreadable (ci == -1)
-                        fbc[ci].append(fi)
-                        if pbc is not None:
-                            pbc[ci].append(path)
-        return (fbc, pbc) if track_paths else fbc
+def build_prototypes(model, transform, device: str, data_dir: str, img_size: int,
+                     class_map_names, batch_size: int = 64, num_workers: int = 16,
+                     threshold: float = DEFAULT_MIN_THRESHOLD, copy_inliers: bool = False,
+                     feats: dict | None = None, min_threshold: float = DEFAULT_MIN_THRESHOLD):
+    """Compute an L2-normalized mean feature per class from the training split.
 
+    Only the classes listed in `class_map_names` are used, in that order (folders not in the
+    class-map are ignored). A class-map entry whose folder is missing or has no images is warned
+    about and skipped. Parallelized: decode across `num_workers` workers, backbone on batches.
+    `class_names` (return) stays aligned with the prototype matrix used for export/inference.
+
+    Every class gets the SAME reject threshold (`threshold`). Per-class thresholds taken from each
+    class's own training spread were removed: with one video per class the training crops are
+    near-duplicate frames, so that spread measures how the clip happened to be shot rather than how
+    the product varies, and it never sees a negative at all. Use `calibrate_threshold`
+    (`--calibrate`) to choose the constant from measured false-reject / false-accept rates.
+
+    If `copy_inliers` is set, the good inlier crops (cosine dist <= OUTLIER_THR to their class
+    prototype) are copied into `<data_dir>/inlier/<class>/` for training a clean classifier.
+    """
+    if threshold < min_threshold:
+        raise ValueError(f'threshold {threshold} is below the {min_threshold} floor; see '
+                         f'DEFAULT_MIN_THRESHOLD for why. Use calibrate_threshold() to pick one, '
+                         f'or lower the floor with --min-threshold if you really mean it.')
+    t_start = time.time()
     # PROTOTYPE from clean images (matches inference preprocessing; keep it on the clean manifold).
-    feats_by_class, paths_by_class = _extract(transform, track_paths=True)
-
-    # THRESHOLD distances: augmented views to widen the in-distribution distance spread.
-    # GPU mode (default): workers decode+resize only, _GpuAugBatch runs on GPU — fast.
-    # CPU mode (--cpu-aug): _NpAugTransform (albumentations/npaug) runs in workers — faithful
-    #   to training augmentation but slower.
-    # Both modes subsample to aug_max_per_class per class for the aug pass.
-    if aug:
-        import random as _random
-        by_class: list[list] = [[] for _ in class_names]
-        for p, ci in samples:
-            by_class[ci].append((p, ci))
-        rng = _random.Random(0)
-        aug_sample_list: list = []
-        for cls_samples in by_class:
-            cap = aug_max_per_class if aug_max_per_class > 0 else len(cls_samples)
-            chosen = rng.sample(cls_samples, min(cap, len(cls_samples)))
-            aug_sample_list.extend(chosen)
-        n_aug = len(aug_sample_list) * max(1, aug_views)
-        backend = 'CPU npaug' if cpu_aug else 'GPU torchvision'
-        print(f'aug threshold pass: {len(aug_sample_list)} images × {aug_views} views = {n_aug} total '
-              f'(capped at {aug_max_per_class}/class, {backend})')
-        if cpu_aug:
-            aug_tf = _NpAugTransform(img_size)
-            thr_feats_by_class = _extract(aug_tf, sample_list=aug_sample_list,
-                                          repeat=max(1, aug_views))
-        else:
-            gpu_aug = _GpuAugBatch(img_size).to(device).eval()
-            raw_tf = _build_raw_transform(img_size)
-            thr_feats_by_class = _extract(raw_tf, sample_list=aug_sample_list,
-                                          repeat=max(1, aug_views), gpu_aug=gpu_aug)
-    else:
-        thr_feats_by_class = feats_by_class
+    if feats is None:
+        feats = extract_train_features(model, transform, device, data_dir, img_size,
+                                       class_map_names, batch_size, num_workers)
+    class_names, samples = feats['class_names'], feats['samples']
+    feats_by_class, paths_by_class = feats['feats_by_class'], feats['paths_by_class']
 
     OUTLIER_THR = 0.5   # cosine dist > 0.5 ≈ nearly orthogonal; same-class images should be << 0.2
     outlier_root = Path(data_dir) / 'outlier'
@@ -340,7 +466,7 @@ def build_prototypes(model, transform, device: str, data_dir: str, img_size: int
         for i, cls in enumerate(class_names) if feats_by_class[i]
     ]) if init_proto_names else None                     # [C, D], L2-normalized
 
-    prototypes, thresholds = {}, {}
+    prototypes = {}
     for i, cls in enumerate(class_names):
         if not feats_by_class[i]:
             continue
@@ -394,19 +520,8 @@ def build_prototypes(model, transform, device: str, data_dir: str, img_size: int
 
         proto = F.normalize(feats.mean(dim=0), dim=0)        # normalized class mean
         prototypes[cls] = proto
-        thr_feats = torch.stack(thr_feats_by_class[i]) if thr_feats_by_class[i] else feats
-        # Also filter aug outliers against the clean prototype
-        thr_dists = 1.0 - (thr_feats @ proto)
-        thr_feats = thr_feats[thr_dists <= OUTLIER_THR]
-        if len(thr_feats) == 0:
-            thr_feats = feats
-        dists = 1.0 - (thr_feats @ proto)                    # distances used for the threshold
-        # PER-CLASS threshold: this class's own distance spread, not a single global value
-        # (a global threshold is dominated by diffuse catch-all classes like 'others').
-        thr = float(torch.quantile(dists, threshold_quantile))
-        thresholds[cls] = thr
-        print(f'{cls:12s}: {len(feats):4d} imgs, mean={dists.mean():.4f}, '
-              f'max={dists.max():.4f}, thr={thr:.4f}')
+        dists = 1.0 - (feats @ proto)                        # reported only; not used for the thr
+        print(f'{cls:12s}: {len(feats):4d} imgs, mean={dists.mean():.4f}, max={dists.max():.4f}')
 
     # keep class_names aligned with classes that produced a prototype
     class_names = [c for c in class_names if c in prototypes]
@@ -419,23 +534,210 @@ def build_prototypes(model, transform, device: str, data_dir: str, img_size: int
         print(f'inliers copied: {n_inliers_copied} images → {_short_path(inlier_root, data_dir)}')
         if inlier_rows:
             _write_aligned_csv(inlier_root / 'inlier.txt', ('classtype/file', 'distance'), inlier_rows)
-    print(f'build_prototypes: {len(class_names)} classes, {len(samples)} images '
-          f'in {time.time() - t_start:.1f}s')
-    return prototypes, class_names, thresholds
+    print(f'build_prototypes: {len(class_names)} classes, {len(samples)} images, '
+          f'constant threshold={threshold:.4f}, in {time.time() - t_start:.1f}s')
+    return prototypes, class_names
+
+
+def _loo_positive_dists(feats: torch.Tensor) -> torch.Tensor:
+    """Leave-one-image-out distance from each feature to its own class prototype.
+
+    The plain distance ``1 - f_j . normalize(mean(F))`` is biased low because f_j is itself part of
+    the mean it is scored against — and with one video per class the crops are near-duplicate
+    frames, so the bias is large. Excluding f_j from the mean removes it exactly:
+    ``proto_(-j) = normalize((S - f_j) / (N-1))`` with ``S = sum(F)``; the 1/(N-1) cancels under
+    normalize, so this is one vectorized expression over all j.
+
+    Returns [N] distances, or an empty tensor when N < 3 (LOO is meaningless for a tiny class).
+    """
+    if feats.shape[0] < 3:
+        return feats.new_empty(0)
+    loo = F.normalize(feats.sum(dim=0, keepdim=True) - feats, dim=1)   # [N, D]
+    return 1.0 - (feats * loo).sum(dim=1)                              # [N]
+
+
+@torch.no_grad()
+def calibrate_threshold(model, transform, device: str, data_dir: str, img_size: int,
+                        class_map_names, batch_size: int = 64, num_workers: int = 16,
+                        aug: bool = True, aug_views: int = 2, aug_max_per_class: int = 100,
+                        cpu_aug: bool = False, seed: int = 0, feats: dict | None = None,
+                        min_threshold: float = DEFAULT_MIN_THRESHOLD):
+    """Sweep candidate constant thresholds, reporting MEASURED false-reject / false-accept rates.
+
+    Uses only trusted labelled data under ``<data_dir>/train/`` — no curated negative set needed.
+    Two leave-one-out estimators, both from a single feature-extraction pass:
+
+    - FALSE REJECT (a known product wrongly rejected): the probe must not be inside the prototype
+      it is scored against. With ``aug`` the probe is an augmented view, which is never part of the
+      (clean) prototype, so the plain distance is already unbiased. Without ``aug`` the probe IS one
+      of the prototype's own images, so `_loo_positive_dists` removes it from the mean first.
+    - FALSE ACCEPT (an un-enrolled product wrongly accepted): leave-one-CLASS-out. For class c its
+      own prototype is masked out and its images are scored against the remaining ones — by
+      construction c is now a product that was never enrolled. Each prototype is built only from its
+      own class's images, so dropping c leaves the others unchanged: a column mask, not a rebuild.
+
+    Returns (suggested_threshold, d_pos, d_neg).
+    """
+    t_start = time.time()
+    # Clean features -> prototypes, using the SAME robust construction as build_prototypes.
+    if feats is None:
+        feats = extract_train_features(model, transform, device, data_dir, img_size,
+                                       class_map_names, batch_size, num_workers)
+    class_names, samples = feats['class_names'], feats['samples']
+    feats_by_class, paths_by_class = feats['feats_by_class'], feats['paths_by_class']
+    n_all = len(class_names)
+    print(f'\nCalibrating on {len(samples)} images across {n_all} classes '
+          f'(of {len(class_map_names)} in the class-map)')
+    OUTLIER_THR = 0.5
+    protos, keep_names, keep_idx, keep_feats = [], [], [], []
+    clean_samples, n_outliers = [], 0
+    for i, cls in enumerate(class_names):
+        if not feats_by_class[i]:
+            continue
+        f = torch.stack(feats_by_class[i])
+        keep = (1.0 - (f @ F.normalize(f.mean(dim=0), dim=0))) <= OUTLIER_THR
+        n_outliers += int((~keep).sum())
+        f = f[keep]
+        if len(f) == 0:
+            continue
+        protos.append(F.normalize(f.mean(dim=0), dim=0))
+        keep_names.append(cls)
+        keep_idx.append(i)
+        keep_feats.append(f)
+        # Outliers are dropped from the PROBE set too, not just from the prototype. They are
+        # mislabelled crops — far from their own class, near another — so scoring them charges the
+        # threshold for a false reject AND, under leave-one-class-out, a false accept, when in both
+        # cases the model is behaving correctly. Leaving them in manufactures an error floor, which
+        # then widens the plateau (defined as floor + 0.2pp) and drags the suggestion with it.
+        clean_samples += [(paths_by_class[i][j], i) for j, k in enumerate(keep.tolist()) if k]
+    if len(keep_names) < 2:
+        raise RuntimeError('calibration needs at least 2 classes with usable images')
+    proto_mat = torch.stack(protos)                                # [C, D]
+    if n_outliers:
+        print(f'excluded {n_outliers} outlier crop(s) (dist>{OUTLIER_THR}) from prototypes AND probes')
+
+    # Probe features. Augmented views give a realistic in-distribution spread; the clean training
+    # crops are near-duplicate video frames and read optimistically tight. Prototypes stay clean.
+    if aug:
+        probe_by_class = _aug_probe_features(model, clean_samples, class_names, img_size, device,
+                                             batch_size, num_workers, aug_views,
+                                             aug_max_per_class, cpu_aug, seed=seed)
+        probes = [torch.stack(probe_by_class[i]) if probe_by_class[i] else None for i in keep_idx]
+    else:
+        probes = list(keep_feats)
+
+    d_pos_by_class, d_neg_by_class = [], []
+    for k, pf in enumerate(probes):
+        if pf is None or len(pf) == 0:
+            d_pos_by_class.append(torch.empty(0))
+            d_neg_by_class.append(torch.empty(0))
+            continue
+        # positives: unbiased already when augmented, else leave-one-image-out
+        d_pos_by_class.append((1.0 - (pf @ proto_mat[k])) if aug else _loo_positive_dists(pf))
+        d = 1.0 - (pf @ proto_mat.t())          # [n, C]
+        d[:, k] = float('inf')                  # leave-one-CLASS-out: class k is not enrolled
+        d_neg_by_class.append(d.min(dim=1).values)
+
+    d_pos = torch.cat([d for d in d_pos_by_class if d.numel()]).numpy()
+    d_neg = torch.cat([d for d in d_neg_by_class if d.numel()]).numpy()
+    if not len(d_pos) or not len(d_neg):
+        raise RuntimeError('calibration produced no usable distances')
+
+    # Sweep. Sorting once turns every threshold into a searchsorted, so the grid is nearly free.
+    sp, sn = np.sort(d_pos), np.sort(d_neg)
+    frr = lambda t: 1.0 - np.searchsorted(sp, t, side='right') / len(sp)   # known rejected
+    far = lambda t: np.searchsorted(sn, t, side='right') / len(sn)         # un-enrolled accepted
+
+    # When the two classes separate cleanly the space between them is empty, and a uniform grid
+    # wastes every row on it. Sample where the curves actually move instead: the upper tail of the
+    # positives (drives FRR) and the lower tail of the negatives (drives FAR).
+    display = np.unique(np.concatenate([
+        np.percentile(sp, [50, 75, 90, 95, 98, 99, 99.5, 99.9]),
+        np.percentile(sn, [0.1, 0.5, 1, 2, 5, 10, 25]),
+    ]))
+
+    # Suggested operating point: the centre of the widest plateau where the worse of the two error
+    # rates stays near its achievable floor. Both curves are flat across the empty gap, so an
+    # equal-error point would be arbitrary; the plateau midpoint is the value that survives the most
+    # distribution shift in either direction before it starts costing anything.
+    grid = np.linspace(float(min(sp[0], sn[0])), float(max(sp[-1], sn[-1])), 4000)
+    worse = np.maximum([frr(t) for t in grid], [far(t) for t in grid])
+    ok = np.flatnonzero(worse <= worse.min() + 0.002)                      # within 0.2pp of floor
+    splits = np.flatnonzero(np.diff(ok) > 1)
+    runs = np.split(ok, splits + 1)
+    plateau = max(runs, key=len)
+    lo_p, hi_p = float(grid[plateau[0]]), float(grid[plateau[-1]])
+    suggested = 0.5 * (lo_p + hi_p)
+    if lo_p <= round(suggested, 2) <= hi_p:   # don't imply precision the plateau can't support
+        suggested = round(suggested, 2)
+    if suggested < min_threshold:
+        print(f'\nWARNING - calibration suggested {suggested:.4f}, below the {min_threshold} floor; '
+              f'clamped to {min_threshold}.\n          A suggestion this low means the positives and '
+              f'negatives are not well separated:\n          check for mislabelled crops (see '
+              f'outlier.txt) or classes that are near-duplicates.\n          Override the floor '
+              f'with --min-threshold if the low value is genuinely what you want.')
+        suggested = min_threshold
+
+    print(f'\npositives (known, {"augmented" if aug else "leave-one-image-out"}): n={len(sp)}  '
+          f'med={np.median(sp):.4f}  p95={np.percentile(sp, 95):.4f}  max={sp[-1]:.4f}')
+    print(f'negatives (leave-one-class-out)                    : n={len(sn)}  '
+          f'med={np.median(sn):.4f}  p05={np.percentile(sn, 5):.4f}  min={sn[0]:.4f}')
+    print(f'\n{"thr":>8}  {"FRR (known rejected)":>22}  {"FAR (unenrolled accepted)":>26}')
+    print(f'{"-" * 60}')
+    for t in display:
+        print(f'{t:8.4f}  {frr(t) * 100:21.2f}%  {far(t) * 100:25.2f}%')
+    print(f'\nsafe plateau: [{lo_p:.4f} .. {hi_p:.4f}] — anywhere in here performs within 0.2pp')
+    print(f'suggested   : {suggested:.4f}  '
+          f'(FRR={frr(suggested) * 100:.2f}%, FAR={far(suggested) * 100:.2f}%)   '
+          f'[floor {min_threshold}]')
+
+    # Per-class breakdown at the suggested value: a bad class should be visible, not averaged away.
+    rows = []
+    for k, cls in enumerate(keep_names):
+        dp, dn = d_pos_by_class[k], d_neg_by_class[k]
+        rows.append((cls,
+                     float((dp > suggested).float().mean()) if dp.numel() else float('nan'),
+                     float((dn <= suggested).float().mean()) if dn.numel() else float('nan')))
+    worst_frr = sorted(rows, key=lambda r: -(r[1] if r[1] == r[1] else -1))[:8]
+    worst_far = sorted(rows, key=lambda r: -(r[2] if r[2] == r[2] else -1))[:8]
+    print(f'\nworst classes at thr={suggested:.4f}')
+    print(f'  {"by false-reject":<28}{"by false-accept":<28}')
+    for a, b in zip(worst_frr, worst_far):
+        print(f'  {a[0][:18]:<20}{a[1] * 100:6.1f}%  {b[0][:18]:<20}{b[2] * 100:6.1f}%')
+
+    print('\nCAVEATS')
+    print('  - LOCO negatives are other posm standees: same domain, same photographic style, so')
+    print('    they sit closer to the prototypes than a random shelf photo would. FAR here is a')
+    print('    PESSIMISTIC bound — real-world unknowns should be rejected at least this well.')
+    print('  - No val/test split exists, so every number is train-domain.')
+    print('  - The suggestion is the plateau midpoint, which weights false-reject and false-accept')
+    print('    equally. There is currently no flag to bias it toward one; --min-threshold can only')
+    print('    raise the floor (more permissive), not make the decision stricter.')
+    print(f'\ncalibrate_threshold: {time.time() - t_start:.1f}s')
+    return {
+        'suggested': suggested, 'plateau': (lo_p, hi_p),
+        'class_names': keep_names, 'd_pos': d_pos, 'd_neg': d_neg,
+        'd_pos_by_class': [d.numpy() for d in d_pos_by_class],
+        'd_neg_by_class': [d.numpy() for d in d_neg_by_class],
+    }
 
 
 class _OpenSetWrapper(torch.nn.Module):
     """Backbone + prototype constants + cosine-distance head, ready for ONNX/NCNN export.
 
-    Uses a PER-CLASS threshold vector (each class judged against its own distance spread).
+    The reject threshold is a single SCALAR shared by every class, not a [C] vector. Calibration
+    measured that per-class thresholds overfit badly (3.8x worse on held-out data, with a ceiling of
+    only +0.03pp even fitted perfectly), so there is nothing to gain from carrying C copies.
 
     Two output modes (selected by ``no_argmin``):
 
-    - ``no_argmin=False`` (default) — IN-GRAPH argmin: the nearest-prototype selection and
-      the reject decision are baked into the graph, so the model emits scalars directly. This needs
-      the ncnn runtime to support ArgMin + the dynamic-index Crop (gather); a stock pip ncnn wheel
-      does not (ncnn has no ``ArgMin`` layer at all; its ``ArgMax`` layer exists but is OFF by
-      default and is a different op), so deploy with a custom layer.
+    - ``no_argmin=False`` (default) — IN-GRAPH argmin: the nearest-prototype selection and the
+      reject decision are baked into the graph, so the model emits scalars directly. The scalar
+      threshold drops the ``thresh[best_idx]`` gather this used to need, but ``best_dist =
+      dists[best_idx]`` is still a dynamic-index gather, so the tail remains ``ArgMin → Gather →
+      Sub``. A stock pip ncnn wheel supports neither (ncnn has no ``ArgMin`` layer at all; its
+      ``ArgMax`` exists but is OFF by default and is a different op), so this path STILL needs the
+      custom decision layer — the scalar threshold does not change that.
       Outputs: ``best_class_idx`` (int64 scalar), ``best_dist`` (float32), ``margin`` (float32; >0
       → unknown).
 
@@ -450,14 +752,14 @@ class _OpenSetWrapper(torch.nn.Module):
             self,
             backbone: torch.nn.Module,
             proto_mat: torch.Tensor,
-            thresh_vec: torch.Tensor,
+            threshold: float,
             no_argmin: bool = False,
     ):
         super().__init__()
         self.backbone = backbone
         self.no_argmin = no_argmin
         self.register_buffer('proto_mat', proto_mat)   # [C, D], L2-normalized
-        self.register_buffer('thresh', thresh_vec.to(torch.float32))  # [C] per-class thresholds
+        self.register_buffer('thresh', torch.tensor(float(threshold)))  # scalar, shared by all C
 
     def forward(self, x: torch.Tensor) -> tuple:
         feat = self.backbone.forward_head(self.backbone.forward_features(x), pre_logits=True)  # [1, D]
@@ -467,7 +769,7 @@ class _OpenSetWrapper(torch.nn.Module):
             # Client-side argmin: emit per-class vectors only (no argmax/gather in the graph).
             sims = feat @ self.proto_mat.t()                # [1, C] cosine similarity
             dists = 1.0 - sims                              # [1, C] cosine distance
-            margins = dists - self.thresh                   # [1, C] per-class reject margin (>0 unknown)
+            margins = dists - self.thresh                   # [1, C] reject margin (>0 unknown)
             return dists, margins
 
         # In-graph argmin: nearest prototype is the smallest cosine distance.
@@ -476,19 +778,19 @@ class _OpenSetWrapper(torch.nn.Module):
         dists = 1.0 - sims                                  # [C] cosine distances
         best_idx = dists.argmin()
         best_dist = dists[best_idx]                         # cosine distance of the nearest prototype
-        margin = best_dist - self.thresh[best_idx]           # per-class; >0 → unknown, <0 → known
+        margin = best_dist - self.thresh                    # scalar subtract; >0 → unknown
         return best_idx, best_dist, margin
 
 
 @torch.no_grad()
-def export_openset_pt(model, prototypes, class_names, thresholds, output_path, img_size=224,
-                      no_argmin=False):
+def export_openset_pt(model, prototypes, class_names, threshold, output_path, img_size=224,
+                      no_argmin=False, meta_extra: dict | None = None):
     """Trace the open-set model (_OpenSetWrapper) to a TorchScript .pt for PNNX → ncnn.
 
     Uses the SAME _OpenSetWrapper as export_openset_onnx, so the ONNX and TorchScript exports are
-    the identical model. Per-class thresholds are baked in. Also writes a sidecar
-    <output_path>.meta.json with the class order, per-class thresholds (index→name), and the
-    ``no_argmin`` flag so the predict/load paths know the output format.
+    the identical model. The scalar reject threshold is baked in. Also writes a sidecar
+    <output_path>.meta.json with the class order, the scalar ``threshold``, and the ``no_argmin``
+    flag so the predict/load paths know the output format.
 
     Args:
         no_argmin: if True, export the client-side-argmin variant (per-class ``dists``/``margins``
@@ -496,21 +798,22 @@ def export_openset_pt(model, prototypes, class_names, thresholds, output_path, i
     """
     import json
     proto_mat = torch.stack([prototypes[c] for c in class_names]).cpu()  # [C, D]
-    thresh_vec = torch.tensor([thresholds[c] for c in class_names])      # [C]
     # trace on CPU so the .pt is portable and PNNX/ncnn-friendly
-    net = _OpenSetWrapper(model.cpu(), proto_mat, thresh_vec, no_argmin=no_argmin).eval()
+    net = _OpenSetWrapper(model.cpu(), proto_mat, threshold, no_argmin=no_argmin).eval()
     example = torch.zeros(1, 3, img_size, img_size)
     ts = torch.jit.trace(net, example)
     Path(output_path).parent.mkdir(parents=True, exist_ok=True)
     ts.save(output_path)
     meta = {'class_names': list(class_names),
-            'thresholds': [float(thresholds[c]) for c in class_names],
-            'img_size': img_size, 'mean': list(MEAN), 'std': list(STD), 'no_argmin': no_argmin}
+            'threshold': float(threshold),
+            'img_size': img_size, 'mean': list(MEAN), 'std': list(STD),
+            'resize': RESIZE_FILTER, 'no_argmin': no_argmin}
+    meta.update(meta_extra or {})       # threshold provenance, when it was calibrated
     with open(output_path + '.meta.json', 'w') as f:
         json.dump(meta, f, indent=2)
     outputs = 'dists, margins (client argmin)' if no_argmin else 'best_class_idx, best_dist, margin'
     print(f'TorchScript open-set model → {output_path}  [outputs: {outputs}]')
-    print(f'  meta (classes + per-class thresholds) → {output_path}.meta.json')
+    print(f'  meta (classes + scalar threshold) → {output_path}.meta.json')
     print(f'  next: pnnx {output_path} inputshape=[1,3,{img_size},{img_size}]')
 
 
@@ -519,21 +822,22 @@ def export_openset_onnx(
         model: torch.nn.Module,
         prototypes: dict,
         class_names: list,
-        thresholds: dict,
+        threshold: float,
         output_path: str,
         img_size: int = 224,
         no_argmin: bool = False,
+        meta_extra: dict | None = None,
 ) -> None:
     """Export the full open-set pipeline as a single ONNX graph.
 
-    The exported model embeds the class prototypes and per-class thresholds as constants,
+    The exported model embeds the class prototypes and the scalar threshold as constants,
     so at inference time only the raw image is needed as input.
 
     Args:
         model: Trained backbone (already on the target device, eval mode).
         prototypes: Dict mapping class name → L2-normalized prototype tensor [D].
         class_names: Ordered list of class names (determines output index mapping).
-        thresholds: Dict mapping class name → per-class cosine-distance reject threshold.
+        threshold: Scalar cosine-distance reject threshold, shared by every class.
         output_path: Destination .onnx file path.
         img_size: Square input size for the exported graph.
         no_argmin: if True, export the client-side-argmin variant (per-class ``dists``/``margins``
@@ -541,9 +845,7 @@ def export_openset_onnx(
     """
     proto_mat = torch.stack([prototypes[c] for c in class_names])  # [C, D]
     device = next(model.parameters()).device
-    thresh_vec = torch.tensor([thresholds[c] for c in class_names], device=device)  # [C]
-
-    wrapper = _OpenSetWrapper(model, proto_mat.to(device), thresh_vec, no_argmin=no_argmin).eval()
+    wrapper = _OpenSetWrapper(model, proto_mat.to(device), threshold, no_argmin=no_argmin).eval()
 
     output_names = ['dists', 'margins'] if no_argmin else ['best_class_idx', 'best_dist', 'margin']
     dummy = torch.zeros(1, 3, img_size, img_size, device=device)
@@ -559,30 +861,32 @@ def export_openset_onnx(
     )
     import json
     meta = {'class_names': list(class_names),
-            'thresholds': [float(thresholds[c]) for c in class_names],
-            'img_size': img_size, 'mean': list(MEAN), 'std': list(STD), 'no_argmin': no_argmin}
+            'threshold': float(threshold),
+            'img_size': img_size, 'mean': list(MEAN), 'std': list(STD),
+            'resize': RESIZE_FILTER, 'no_argmin': no_argmin}
+    meta.update(meta_extra or {})       # threshold provenance, when it was calibrated
     with open(output_path + '.meta.json', 'w') as f:
         json.dump(meta, f, indent=2)
     print(f'ONNX exported → {output_path}')
-    print(f'  meta (classes + per-class thresholds) → {output_path}.meta.json')
+    print(f'  meta (classes + scalar threshold) → {output_path}.meta.json')
 
 
 @torch.no_grad()
-def predict_openset(model, transform, prototypes, class_names, thresholds, img_path, device):
+def predict_openset(model, transform, prototypes, class_names, threshold, img_path, device):
     feat = extract_feature(model, transform, img_path, device)   # [1280]
     proto_mat = torch.stack([prototypes[c] for c in class_names])  # [C, 1280]
     dists = 1.0 - (proto_mat @ feat)                              # cosine distance to each class
     best_idx = int(dists.argmin())
     best_dist = float(dists[best_idx])
     nearest = class_names[best_idx]
-    # reject if the nearest distance exceeds THAT class's own threshold
-    if best_dist > thresholds[nearest]:
+    # reject when the nearest prototype is farther than the shared threshold
+    if best_dist > threshold:
         return 'unknown', best_dist, nearest
     return nearest, best_dist, nearest
 
 
 @torch.no_grad()
-def predict_openset_many(model, transform, prototypes, class_names, thresholds, img_paths, device,
+def predict_openset_many(model, transform, prototypes, class_names, threshold, img_paths, device,
                          img_size, batch_size=64, num_workers=8):
     """Batched open-set prediction over many images (DataLoader decode + batched backbone).
 
@@ -612,7 +916,7 @@ def predict_openset_many(model, transform, prototypes, class_names, thresholds, 
                 bi = int(best[b])
                 bd = float(dists[b, bi])
                 nearest = class_names[bi]
-                label = 'unknown' if bd > thresholds[nearest] else nearest
+                label = 'unknown' if bd > threshold else nearest
                 results.append((label, bd, nearest))
     return results
 
@@ -656,8 +960,7 @@ def predict_onnx(
         Tuple of (label, best_dist, nearest_class) where label is 'unknown'
         when the cosine distance exceeds the embedded threshold.
     """
-    img = Image.open(img_path).convert('RGB')
-    x = transform(img).unsqueeze(0).numpy()           # [1, 3, H, W] float32
+    x = transform(img_path).unsqueeze(0).numpy()      # [1, 3, H, W] float32
     if no_argmin:
         dists, margins = session.run(['dists', 'margins'], {'image': x})
         dists, margins = dists[0], margins[0]         # [C] (drop batch dim)
@@ -686,8 +989,7 @@ def predict_pt(ts_model, transform, class_names, img_path, no_argmin=False, devi
     vectors and the argmin is done here; False → the model returns the scalar decision directly.
     ``device`` must match where ``ts_model`` lives ('cpu' or 'cuda').
     """
-    img = Image.open(img_path).convert('RGB')
-    x = transform(img).unsqueeze(0).to(device)         # [1, 3, H, W] float32
+    x = transform(img_path).unsqueeze(0).to(device)    # [1, 3, H, W] float32
     if no_argmin:
         dists, margins = ts_model(x)
         dists, margins = dists[0], margins[0]          # [C] (drop batch dim)
@@ -738,18 +1040,29 @@ def main():
              'Converts/runs on a stock ncnn wheel. Default keeps the in-graph argmin scalar outputs.',
     )
     parser.add_argument(
-        '--quantile', default=0.97, type=float, metavar='Q',
-        help='reject threshold quantile (default: 0.97)',
+        '--min-threshold', default=DEFAULT_MIN_THRESHOLD, type=float, metavar='M',
+        help=f'floor on the calibrated threshold (default: {DEFAULT_MIN_THRESHOLD}). A suggestion '
+             f'below this is clamped up and warned about, since a tiny threshold rejects genuine '
+             f'products (0.02 costs ~10%% false-reject on posmlv) while barely reducing '
+             f'false-accepts. Lower it only if you know the low value is real.',
+    )
+    parser.add_argument(
+        '--calibrate', action='store_true', default=False,
+        help='report-only: print the false-reject / false-accept sweep and exit WITHOUT exporting. '
+             'The same calibration runs on every export, so this is for inspecting the curve.',
     )
     parser.add_argument(
         '--aug', action=argparse.BooleanOptionalAction, default=True,
-        help='use npaug augmentation to calibrate thresholds (prototype stays clean); --no-aug to disable',
+        help='during --calibrate, probe with npaug-augmented views so the in-distribution spread '
+             'reflects real variation instead of near-duplicate video frames (prototypes stay '
+             'clean); --no-aug probes with the clean crops and leave-one-image-out instead',
     )
-    parser.add_argument('--aug-views', default=2, type=int, help='augmented views per image for thresholds (default: 2)')
+    parser.add_argument('--aug-views', default=2, type=int,
+                        help='augmented probe views per image during --calibrate (default: 2)')
     parser.add_argument('--aug-max-per-class', default=100, type=int,
-                        help='max images per class for aug threshold pass (default: 100); 0 = use all')
+                        help='max images per class for the aug probe pass (default: 100); 0 = use all')
     parser.add_argument('--cpu-aug', action='store_true', default=False,
-                        help='use CPU npaug (albumentations) instead of GPU torchvision aug for thresholds')
+                        help='use CPU npaug (albumentations) instead of GPU torchvision for the aug probe')
     parser.add_argument('--copy-inliers', action='store_true', default=False,
                         help='copy the good inlier crops (cosine dist<=0.5 to their class prototype) into '
                              '<data-dir>/inlier/<class>/ for training a clean classifier')
@@ -780,13 +1093,15 @@ def main():
         # img_size fails loudly on shape, but a wrong mean/std fails SILENTLY with bad distances.
         img_size = meta.get('img_size', args.img_size)
         mean, std = meta.get('mean', MEAN), meta.get('std', STD)
+        resize = meta.get('resize', RESIZE_FILTER)
         if requested_img_size is not None and requested_img_size != img_size:
             print(f'WARNING — ignoring --img-size {requested_img_size}; the model was exported at '
                   f'{img_size} (from {meta_path})')
         transform = build_transform(img_size, mean=mean, std=std)
         print(f'ONNX model : {args.load_onnx}')
         print(f'Classes    : {len(class_names)} (from {meta_path})')
-        print(f'Preprocess : {img_size}x{img_size}, mean={tuple(mean)}, std={tuple(std)} (from {meta_path})')
+        print(f'Preprocess : {img_size}x{img_size}, mean={tuple(mean)}, std={tuple(std)}, '
+              f'resize={resize} (from {meta_path})')
         print(f'Output     : {"dists/margins (client argmin)" if no_argmin else "scalar (in-graph argmin)"}\n')
         session = load_openset_onnx(args.load_onnx, use_gpu=args.gpu_predict)
         img_paths = [args.image] if args.image else _scan_eval_images(args.data_dir)
@@ -825,25 +1140,52 @@ def main():
     load_checkpoint(model, checkpoint, weights_only=False)
     model.eval().to(device)
 
-    print('Building class prototypes from training set...')
-    prototypes, class_names, thresholds = build_prototypes(
+    # One clean feature pass, shared by calibration and prototype building.
+    feats = extract_train_features(model, transform, device, args.data_dir, args.img_size,
+                                   class_map_names)
+
+    # The threshold is ALWAYS calibrated -- there is no way to pin one. A hand-set value goes stale
+    # silently the moment the checkpoint or the class set changes, and nothing in the artifact would
+    # show it. Calibration is seeded, so this stays reproducible.
+    calib = calibrate_threshold(
         model, transform, device, args.data_dir, args.img_size, class_map_names,
-        threshold_quantile=args.quantile, aug=args.aug, aug_views=args.aug_views,
-        aug_max_per_class=args.aug_max_per_class or 0, cpu_aug=args.cpu_aug,
-        copy_inliers=args.copy_inliers)
-    print(f'\nPer-class thresholds computed ({len(class_names)} classes, quantile={args.quantile}, '
-          f'aug={args.aug})\n')
+        aug=args.aug, aug_views=args.aug_views,
+        aug_max_per_class=args.aug_max_per_class or 0, cpu_aug=args.cpu_aug, feats=feats,
+        min_threshold=args.min_threshold)
+    if args.calibrate:                      # report-only mode: never exports
+        return
+    threshold = calib['suggested']
+    # Record how the threshold was reached, so the artifact carries its own evidence rather
+    # than that living in someone's shell history.
+    meta_extra = {
+        'threshold_source': 'calibrated',
+        'threshold_frr': float(np.mean(calib['d_pos'] > threshold)),
+        'threshold_far': float(np.mean(calib['d_neg'] <= threshold)),
+        'threshold_plateau': [round(calib['plateau'][0], 4), round(calib['plateau'][1], 4)],
+        'threshold_floor': args.min_threshold,
+    }
+    print(f'\nCalibrated threshold {threshold} (FRR={meta_extra["threshold_frr"] * 100:.2f}%, '
+          f'FAR={meta_extra["threshold_far"] * 100:.2f}%)')
+
+    print('Building class prototypes from training set...')
+    prototypes, class_names = build_prototypes(
+        model, transform, device, args.data_dir, args.img_size, class_map_names,
+        threshold=threshold, copy_inliers=args.copy_inliers, feats=feats,
+        min_threshold=args.min_threshold)
+    print(f'\nConstant threshold {threshold:.4f} applied to {len(class_names)} classes\n')
 
     onnx_path = pt_path = None
     if args.export_onnx is not None:
         onnx_path = args.export_onnx or os.path.splitext(checkpoint)[0] + '_openset.onnx'
-        export_openset_onnx(model, prototypes, class_names, thresholds, onnx_path,
-                            img_size=args.img_size, no_argmin=args.no_argmin)
+        export_openset_onnx(model, prototypes, class_names, threshold, onnx_path,
+                            img_size=args.img_size, no_argmin=args.no_argmin,
+                            meta_extra=meta_extra)
 
     if args.export_pt is not None:
         pt_path = args.export_pt or os.path.splitext(checkpoint)[0] + '_openset.pt'
-        export_openset_pt(model, prototypes, class_names, thresholds, pt_path,
-                          img_size=args.img_size, no_argmin=args.no_argmin)
+        export_openset_pt(model, prototypes, class_names, threshold, pt_path,
+                          img_size=args.img_size, no_argmin=args.no_argmin,
+                          meta_extra=meta_extra)
 
     if args.image:
         img_paths = [args.image]
@@ -871,7 +1213,7 @@ def main():
         model.to(predict_device)
         print(f'Predicting via in-memory PyTorch prototypes [{predict_device}]\n')
         predict_many = lambda paths: predict_openset_many(
-            model, transform, prototypes, class_names, thresholds, paths, predict_device,
+            model, transform, prototypes, class_names, threshold, paths, predict_device,
             args.img_size)
 
     # Report per image: expected class (val/test subfolder), detected type, and nearest distance.
