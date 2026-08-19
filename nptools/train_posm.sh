@@ -173,6 +173,7 @@ AMP_FLAGS=""
  # dataset instead of migrating into the resized copy on the first run that enables this.
  # Only DATA_DIR (what train.py reads images from) is redirected. Idempotent -- a second launch
  # re-checks mtimes and rewrites nothing, so this costs a directory walk once the tree exists.
+ORIG_DATA_DIR="${DATA_DIR}"
 RESIZE_SIZE=$((2 * IMG_SIZE))            # npaug's canvas; see IMG_SIZE above
 RESIZED_DIR="${DATA_DIR%/}_${RESIZE_SIZE}"
 if uv run python -m nptools.resize_dataset \
@@ -238,7 +239,67 @@ fi
      ${RESUME_OR_NEW} \
      ${EXTRA_ARGS}
      #--bg-dir="${DATA_DIR}/bg_photos" \
+TRAIN_STATUS=$?
 
+
+ # ── After training: PRINT (do not run) the open-set export command ──────────────────────────────
+ # The follow-up step needs three paths that only this script knows (the timestamped run dir, the
+ # class-map, and openset.py's data-dir), so reconstructing it by hand is where mistakes happen.
+ #
+ # openset.py wants the directory that CONTAINS train/, which is NOT necessarily train.py's
+ # --data-dir: this wrapper is usually pointed straight at the class-folder root (timm falls back to
+ # the root when <data-dir>/train is absent), in which case openset.py wants its PARENT.
+ # ORIG_DATA_DIR, not DATA_DIR: prototypes and the calibrated threshold must come from the images a
+ # deployed client will actually see, i.e. the originals -- not from a copy pre-shrunk for training.
+if [ -d "${ORIG_DATA_DIR}/train" ]; then
+    OPENSET_DATA_DIR="${ORIG_DATA_DIR}"
+else
+    OPENSET_DATA_DIR=$(dirname "${ORIG_DATA_DIR}")
+fi
+BEST=$(ls -td "${OUTPUT_DIR}"/20*/model_best.pth.tar 2>/dev/null | head -1)
+
+if [ "$TRAIN_STATUS" != "0" ]; then
+    echo
+    echo "train.py exited with status ${TRAIN_STATUS} -- not suggesting an export."
+elif [ -z "$BEST" ]; then
+    echo
+    echo "No model_best.pth.tar under ${OUTPUT_DIR}/20*/ -- nothing to export."
+else
+ # --no-argmin keeps the graph free of ArgMin/Gather so a stock ncnn wheel can run it; the client
+ # does argmin over the emitted per-class dists. Class order comes from the .meta.json sidecar.
+ # --img-size must match what was TRAINED, or prototypes are extracted at one scale and the client
+ # feeds another: openset.py defaults to 224 independently of this script, so pass it explicitly.
+ # It is baked into the exported graph and recorded in the sidecar as part of the preprocessing
+ # contract, which makes a mismatch silent -- accuracy just quietly drops.
+ # Both formats go in ONE run: prototype extraction + threshold calibration is the expensive part
+ # and is shared, and it guarantees the two artifacts carry the same prototypes and threshold.
+cat <<EOF
+
+Next step -- export the open-set model (prototypes + calibrated threshold baked in).
+TorchScript (for pnnx -> ncnn) and ONNX in one run:
+
+  uv run --no-sync python nptools/openset.py \\
+      --data-dir ${OPENSET_DATA_DIR} \\
+      --class-map ${CLASS_MAP} \\
+      --checkpoint ${BEST} \\
+      --img-size ${IMG_SIZE} \\
+      --export-pt $(dirname "${BEST}")/openset.pt \\
+      --export-onnx $(dirname "${BEST}")/openset.onnx \\
+      --no-argmin
+
+Drop either --export-* to emit only that format. Each artifact gets a .meta.json sidecar
+(class order, threshold, preprocessing) that the client must read.
+
+Then convert the TorchScript file to ncnn (writes openset.ncnn.param/.bin next to the .pt,
+alongside .pnnx.* intermediates you can delete):
+
+  uv run --no-sync pnnx $(dirname "${BEST}")/openset.pt inputshape=[1,3,${IMG_SIZE},${IMG_SIZE}]
+
+inputshape must match --img-size above: pnnx traces at that shape and constant-folds the
+SAME-padding arithmetic against it, so a wrong value bakes wrong padding into the .param.
+pnnx is not in pyproject.toml -- 'uv pip install pnnx ncnn' if the command is missing.
+EOF
+fi
 
 
 
