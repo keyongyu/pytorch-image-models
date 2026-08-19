@@ -32,6 +32,13 @@ except Exception:
 # Edit this default, or override via env: NOBG_FULL_AUG=1 (on) / 0 (off).
 USE_FULL_AUG = os.environ.get('NOBG_FULL_AUG', '1') not in ('0', 'false', 'False', 'no', 'NO')
 
+# ── Eval decode: let the JPEG decoder pre-shrink (see _draft_decode) ─────────────
+# On by default -- the eval transform resizes to (h, w) immediately, so decoding the full 10 MP
+# original only to throw it away is what left the GPU idle during validate(). Set
+# NOBG_EVAL_DRAFT=0 to restore the full-resolution decode, which keeps eval preprocessing
+# bit-identical to nptools/openset.py's CPU verification path (its ncnn deployment contract).
+USE_EVAL_DRAFT = os.environ.get('NOBG_EVAL_DRAFT', '1') not in ('0', 'false', 'False', 'no', 'NO')
+
 # ── Debug: dump post-augmentation images (what the model actually receives) ──────
 # Enable by setting AUG_DUMP_DIR (e.g. AUG_DUMP_DIR=kytest/after_aug). Saves up to
 # AUG_DUMP_MAX images per worker process as auto-incrementing PNGs. Disabled when unset.
@@ -598,6 +605,30 @@ def _resize_rgb(np_rgb, h, w):
     return np.array(PILImage.fromarray(np_rgb).resize((w, h), PILImage.BILINEAR))
 
 
+def _draft_decode(pil_img, h, w):
+    """Let the JPEG decoder do the first downscale, in the DCT domain (1/2, 1/4, 1/8 only).
+
+    Sources here run to 10 MP while nothing above (h, w) survives the pipeline, and decoding
+    then resizing full resolution costs ~10ms of the ~14ms per sample -- more than the entire
+    augmentation. draft() moves that shrink inside the decoder, which is several times cheaper.
+
+    Only effective while the JPEG is still lazy: train.py passes input_img_mode=None under
+    --nobg (see train.py:702) so timm's dataset does not .convert() -- and therefore does not
+    decode -- before the transform runs. Safe otherwise: draft() is a documented no-op once the
+    image is loaded, and for non-JPEG formats, so PNG cutouts are untouched. It also never
+    scales below the request (it picks a power-of-two reduction that keeps BOTH axes >= the
+    requested size), so an elongated 2766x804 source is left alone rather than crushed.
+
+    mode is passed as None deliberately: the caller converts right after, and asking draft()
+    for a mode change can switch a JPEG to L/YCbCr decoding.
+    """
+    try:
+        pil_img.draft(None, (w, h))
+    except (AttributeError, ValueError, OSError):
+        pass  # already loaded, or a format without draft support -> full-size decode
+    return pil_img
+
+
 def _stretch_rgba(rgba, h, w):
     """Resize an RGBA numpy image to (h, w) via PIL (stretch; ignores aspect)."""
     return np.array(PILImage.fromarray(rgba, mode='RGBA').resize((w, h), PILImage.BILINEAR))
@@ -614,8 +645,8 @@ def _fit_rgb(rgb, h, w, squash, fill):
 
 
 class _NoBgTrainTransform:
-    """Fit the input to the target (h,w) box, then apply the full augmentation pipeline
-    (build_aug_pipeline: heavy geometric + photometric). Handles both:
+    """Fit the input to the pipeline's canvas (2*img_size under build_aug_pipeline, else img_size),
+    then apply the full augmentation pipeline. Handles both:
       - RGBA cutouts (background-removed PNGs) -> composite onto a random background (bg-swap);
       - RGB photos -> fit only (no composite), so the whole dataset shares this albumentations path.
     Note build_aug_pipeline does its own square resize/crop, so it distorts aspect (not
@@ -628,6 +659,15 @@ class _NoBgTrainTransform:
         self.full_aug = USE_FULL_AUG
         self.aug = build_aug_pipeline(img_size=min(self.h, self.w)) if self.full_aug \
             else build_photometric_pipeline()
+        # CANVAS the pipeline actually consumes, which is NOT the model's input size:
+        # build_aug_pipeline normalises to a 2*img_size square (the A.Resize above) and only crops
+        # back to img_size at the end. Fitting the input to (h, w) instead meant handing it a 224
+        # image that A.Resize immediately upsampled to 448 -- every geometric and photometric op
+        # then ran on interpolated pixels, and nothing above 224 ever reached the model no matter
+        # how large the source was. Fitting to the canvas makes that A.Resize a no-op on real
+        # pixels. Doubles as the _draft_decode budget, since it is exactly the detail we can use.
+        # The photometric-only pipeline never resizes, so (h, w) is right for it.
+        self.canvas_h, self.canvas_w = (2 * self.h, 2 * self.w) if self.full_aug else (self.h, self.w)
         self.persp = make_bottom_top_perspective_transform()
         self.mean, self.std = mean, std
         self.normalize, self.use_prefetcher = normalize, use_prefetcher
@@ -641,17 +681,19 @@ class _NoBgTrainTransform:
         return getattr(img, 'mode', '') == 'RGBA'  # fallback when filename unavailable
 
     def __call__(self, pil_img):
+        _draft_decode(pil_img, self.canvas_h, self.canvas_w)  # must precede any decode below
+        ch, cw = self.canvas_h, self.canvas_w
         #if pil_img.mode == 'RGBA':
         if self._is_nobg(pil_img):
             # background-removed cutout: composite onto a random background (bg-swap)
             fg = self.persp(image=np.array(pil_img.convert('RGBA')))['image']
-            fg = _fit_rgba(fg, self.h, self.w, self.squash)  # (h,w,4)
+            fg = _fit_rgba(fg, ch, cw, self.squash)  # (canvas,4)
             alpha = fg[:, :, 3:4].astype(np.float32) / 255.0
-            bg = _bg_rect_rgb(_NOBG_BG_PATHS, self.h, self.w, self.fill)             # (h,w,3) real bg
+            bg = _bg_rect_rgb(_NOBG_BG_PATHS, ch, cw, self.fill)     # (canvas,3) real bg
             comp = (fg[:, :, :3].astype(np.float32) * alpha + bg * (1.0 - alpha)).astype(np.uint8)
         else:
-            # plain RGB photo: fit to the box, no composite
-            comp = _fit_rgb(np.array(pil_img.convert('RGB')), self.h, self.w, self.squash, self.fill)
+            # plain RGB photo: fit to the canvas, no composite
+            comp = _fit_rgb(np.array(pil_img.convert('RGB')), ch, cw, self.squash, self.fill)
         out = self.aug(image=comp)['image']
         if self.full_aug:
             out = _resize_rgb(out, self.h, self.w)     # build_aug_pipeline outputs square -> (h,w)
@@ -668,6 +710,11 @@ class _NoBgEvalTransform:
         self.fill = tuple(fill)  # RGB
 
     def __call__(self, pil_img):
+        # Eval never augments, so (h, w) IS the whole decode budget -- no 2x aug canvas to feed.
+        # Without this, validation was the only remaining full-resolution decode in the run and
+        # starved the GPU: measured sm 7% during validate() vs 63% while training.
+        if USE_EVAL_DRAFT:
+            _draft_decode(pil_img, self.h, self.w)
         # deterministic: fit input to (h,w) per crop mode (eval never augments)
         if pil_img.mode == 'RGBA':
             # cutout: composite onto solid fill
