@@ -18,12 +18,26 @@ CLASS_MAP=""
 # emitting the flag at all -- hence the wrapper owns it, via --no-arcface / --no-per-class-acc.
 ARCFACE=1
 PER_CLASS_ACC=1
-# THE size knob, set by --resize. It is the model input size (forwarded to train.py --img-size) and
-# it also fixes the pre-resize target at 2x it: npaug's build_aug_pipeline normalises every sample
-# to a 2*img_size square before cropping back, so 2*IMG_SIZE -- not IMG_SIZE -- is the most detail
-# the pipeline can use and therefore the right size to store on disk. Storing IMG_SIZE instead would
-# just make the pipeline upsample again.
+# THE size knob, set by --resize. It is the model input size (forwarded to train.py --img-size,
+# and to openset.py / pnnx in the export hint), and it also fixes the pre-resize target at 2x it:
+# npaug's build_aug_pipeline normalises every sample to a 2*img_size square before cropping back,
+# so 2*IMG_SIZE -- not IMG_SIZE -- is the most detail the pipeline can use and therefore the right
+# size to store on disk. Storing IMG_SIZE instead would just make the pipeline upsample again.
 IMG_SIZE=224
+# ON by default too, same store_true reasoning: mixed precision is the only lever left on the GPU
+# side. After the draft() decode fix the loader delivers ~1870 img/s while the 3080 Ti saturates
+# near ~1000, so the GPU -- not the data pipeline -- is what caps the epoch (measured sm 91%).
+# fp16 keeps fp32 master weights and loss-scales the gradients, so accuracy is unaffected, and
+# it is invisible to export: openset.py rebuilds the model and loads fp32 weights (verified --
+# ONNX graph and onnxruntime outputs are bit-identical with or without it).
+# If ArcFace's margin logits ever produce NaN losses, pass --amp-dtype bfloat16 through.
+AMP=1
+# The pre-resize is unconditional: shrinking 10 MP JPEGs on every epoch cost 10.5ms of the 14.3ms
+# per-sample budget -- more than the whole augmentation -- and npaug's PIL draft() cannot help the
+# elongated shelf crops that dominate this dataset (JPEG DCT scaling is uniform, so it only reduces
+# when BOTH axes exceed the budget). Doing it once, offline, is axis-independent. It writes a
+# sibling <data-dir>_<2*IMG_SIZE> tree and trains from that; the originals are never touched, and
+# re-runs are idempotent (mtime-checked), so the cost after the first launch is a directory walk.
 
  # Consume script-level flags here (not forwarded to train.py); anything else is
  # collected in EXTRA_ARGS and passed through. Must run BEFORE `set --` below
@@ -36,6 +50,7 @@ IMG_SIZE=224
  #   --resize    N      model input size    (default: 224; split always pre-resized to 2*N)
  #   --no-arcface       disable --arcface        (on by default)
  #   --no-per-class-acc disable --per-class-acc  (on by default)
+ #   --no-amp           disable --amp            (on by default)
  usage() {
      cat <<EOF
 Usage: sh $0 [options] [-- train.py args...]
@@ -48,20 +63,25 @@ Options:
   --data-dir  PATH   Dataset root.        (default: $DATA_DIR)
   --output-dir PATH  Output/checkpoints.  (default: \$DATA_DIR/output)
   --class-map PATH   Class-map file.      (default: \$DATA_DIR/class_84.txt)
-  --resize N         Model input size. (default: ${IMG_SIZE}) Passed to train.py as --img-size.
-                     The split is ALWAYS pre-resized once into <data-dir>_<2N> and trained from
-                     there, because npaug normalises every sample to a 2*img_size canvas -- 2N is
-                     exactly the detail the pipeline can use. Originals are never modified.
+  --resize N         Model input size. (default: ${IMG_SIZE}) Passed to train.py as --img-size,
+                     and used in the export commands printed at the end. The split is ALWAYS
+                     pre-resized once into <data-dir>_<2N> and trained from there, because npaug
+                     normalises every sample to a 2*img_size canvas -- 2N is exactly the detail
+                     the pipeline can use. Originals are never modified.
   --test-npaug-dir PATH  DRY-RUN: no training; dump augmented images (grouped by class)
                      to PATH for <=4 epochs to visually test nptools/npaug.py.
   --test-npaug-class CLS  Restrict that dry-run to class folder(s) only (comma-separated).
   --no-arcface       Disable --arcface        (ON by default; needed by nptools/openset.py).
   --no-per-class-acc Disable --per-class-acc  (ON by default).
+  --no-amp           Disable --amp (fp16 mixed precision, ON by default; the GPU is the
+                     bottleneck once npaug's draft() decode is in place).
   -h, --help         Show this help and exit.
 
 --num-classes is derived automatically from the class-map (non-empty line count).
---arcface and --per-class-acc are passed to train.py by DEFAULT; pass them explicitly if you
-like (it changes nothing), or use the --no- forms above to turn them off.
+--workers is derived as 2/3 of the PHYSICAL cores (SMT siblings do not help this aug); override
+with WORKERS=N in the environment, or pass --workers=N, since pass-through args come last.
+--arcface, --per-class-acc and --amp are passed to train.py by DEFAULT; pass them explicitly if
+you like (it changes nothing), or use the --no- forms above to turn them off.
 Both "--flag value" and "--flag=value" forms are accepted.
 
 Examples:
@@ -88,7 +108,7 @@ EOF
          --class-map)    CLASS_MAP="$2"; shift ;;
          --class-map=*)  CLASS_MAP="${1#*=}" ;;
          # Consumed, not forwarded verbatim: the wrapper re-emits it as train.py --img-size AND
-         # derives the pre-resize target (2x) from it.
+         # derives the pre-resize target (2x) and the export hint's sizes from it.
          --resize)       IMG_SIZE="$2"; shift ;;
          --resize=*)     IMG_SIZE="${1#*=}" ;;
          --test-npaug-dir)     TEST_NPAUG_DIR="$2"; shift ;;
@@ -101,6 +121,9 @@ EOF
          --no-arcface)         ARCFACE=0 ;;
          --per-class-acc)      PER_CLASS_ACC=1 ;;
          --no-per-class-acc)   PER_CLASS_ACC=0 ;;
+         # ("--amp-dtype bfloat16" takes a value and falls through to EXTRA_ARGS below.)
+         --amp)                AMP=1 ;;
+         --no-amp)             AMP=0 ;;
          *)              EXTRA_ARGS="$EXTRA_ARGS $1" ;;
      esac
      shift
@@ -120,19 +143,37 @@ case "$IMG_SIZE" in
 esac
 [ "$IMG_SIZE" -gt 0 ] || { echo "--resize must be > 0" >&2; exit 2; }
 
- # ── Pre-resize the training split, unconditionally ──────────────────────────────────────────────
- # Shrinking 10 MP JPEGs on every epoch cost 10.5ms of the 14.3ms per-sample budget -- more than the
- # whole augmentation -- and it is pure waste: npaug fits every sample to a 2*img_size canvas, so
- # nothing above that survives. Doing it once, offline, also handles the elongated shelf crops that
- # a JPEG-decoder-side shrink cannot (DCT scaling is uniform, so it only reduces when BOTH axes
- # exceed the budget, and 1737x371 never does). Measured: the 16-worker loader goes 941.8 ->
- # 1820.0 img/s, and the split shrinks 1705 MB -> 879 MB.
+ # Scale DataLoader workers with the box instead of hardcoding: this run is data-bound, not
+ # GPU-bound -- npaug.py's per-sample albumentations costs ~25ms of pure CPU, so throughput is
+ # (workers / 25ms) until the GPU saturates. 2/3 of the cores leaves headroom for the main
+ # process (which feeds the GPU and does its own share of Python work) and for other users.
  #
- # Deliberately AFTER the OUTPUT_DIR / CLASS_MAP / NUM_CLASSES derivations above: those stay
+ # PHYSICAL cores, not nproc: this aug is compute-bound, so SMT siblings do not add throughput.
+ # Measured on the 3960X (24C/48T): 16 workers -> 576 img/s, 32 workers -> ~509 img/s, i.e.
+ # oversubscribing the real cores made per-worker cost rise from 28ms to 63ms per image.
+ # Override for a quick experiment with `WORKERS=22 sh nptools/train_posm.sh ...`.
+if [ -z "${WORKERS}" ]; then
+    # -p lists one row per logical CPU; distinct (core,socket) pairs are the physical cores.
+    CORES=$(lscpu -p=CORE,SOCKET 2>/dev/null | grep -v '^#' | sort -u | wc -l)
+    [ "${CORES:-0}" -gt 0 ] 2>/dev/null || CORES=$(nproc 2>/dev/null || echo 8)
+    WORKERS=$(( CORES * 2 / 3 ))
+    [ "$WORKERS" -ge 1 ] || WORKERS=1
+fi
+
+ # All three are store_true in train.py, so "off" means omitting the flag entirely.
+ARCFACE_FLAGS=""
+[ "$ARCFACE" = "1" ]       && ARCFACE_FLAGS="--arcface"
+[ "$PER_CLASS_ACC" = "1" ] && ARCFACE_FLAGS="${ARCFACE_FLAGS} --per-class-acc"
+AMP_FLAGS=""
+[ "$AMP" = "1" ]           && AMP_FLAGS="--amp --channels-last"
+
+ # ── Pre-resize the training split (see RESIZE above) ────────────────────────────────────────────
+ # Deliberately AFTER the OUTPUT_DIR / CLASS_MAP / NUM_CLASSES derivations above: those must stay
  # anchored to the ORIGINAL data dir, so checkpoints and --resume keep living next to the source
- # dataset instead of migrating into the resized copy. Only DATA_DIR is redirected. Idempotent
- # (mtime-checked), so the cost after the first build is a directory walk.
-RESIZE_SIZE=$((2 * IMG_SIZE))
+ # dataset instead of migrating into the resized copy on the first run that enables this.
+ # Only DATA_DIR (what train.py reads images from) is redirected. Idempotent -- a second launch
+ # re-checks mtimes and rewrites nothing, so this costs a directory walk once the tree exists.
+RESIZE_SIZE=$((2 * IMG_SIZE))            # npaug's canvas; see IMG_SIZE above
 RESIZED_DIR="${DATA_DIR%/}_${RESIZE_SIZE}"
 if uv run python -m nptools.resize_dataset \
         --src "${DATA_DIR%/}" --out "${RESIZED_DIR}" --size "${RESIZE_SIZE}"; then
@@ -141,11 +182,6 @@ if uv run python -m nptools.resize_dataset \
 else
     echo "resize_dataset failed -- falling back to the original images at ${DATA_DIR}"
 fi
-
- # Both are store_true in train.py, so "off" means omitting the flag entirely.
-ARCFACE_FLAGS=""
-[ "$ARCFACE" = "1" ]       && ARCFACE_FLAGS="--arcface"
-[ "$PER_CLASS_ACC" = "1" ] && ARCFACE_FLAGS="${ARCFACE_FLAGS} --per-class-acc"
 
  if [ "${DEBUGPY:-0}" = "1" ]; then
      set -- -m debugpy \
@@ -183,7 +219,7 @@ fi
     --aa=originalr  \
     --color-jitter 0.4 --reprob 0.2 \
     --nobg \
-     --workers=16 \
+     --workers="${WORKERS}" \
      --img-size="${IMG_SIZE}" \
      --crop-pct=1 --batch-size=48 \
      --validation-batch-size=256 \
@@ -198,9 +234,11 @@ fi
      ${TEST_NPAUG_DIR:+--test-npaug-dir="${TEST_NPAUG_DIR}"} \
      ${TEST_NPAUG_CLASS:+--test-npaug-class="${TEST_NPAUG_CLASS}"} \
      ${ARCFACE_FLAGS} \
+     ${AMP_FLAGS} \
      ${RESUME_OR_NEW} \
      ${EXTRA_ARGS}
      #--bg-dir="${DATA_DIR}/bg_photos" \
+
 
 
 
