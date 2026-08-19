@@ -84,12 +84,12 @@ def _scan_eval_images(data_dir: str) -> list:
     return paths
 
 
-def build_transform(img_size: int) -> transforms.Compose:
+def build_transform(img_size: int, mean=MEAN, std=STD) -> transforms.Compose:
     # matches inference: squash (resize whole image to square) + normalize
     return transforms.Compose([
         transforms.Resize((img_size, img_size), interpolation=transforms.InterpolationMode.BICUBIC),
         transforms.ToTensor(),
-        transforms.Normalize(mean=MEAN, std=STD),
+        transforms.Normalize(mean=mean, std=std),
     ])
 
 
@@ -127,6 +127,11 @@ class _GpuAugBatch(torch.nn.Module):
     Output: [B, 3, H, W] augmented + normalized, ready for the backbone.
 
     Workers only decode+resize (fast), all heavy augmentation runs on GPU.
+
+    The augmentation is applied ONE IMAGE AT A TIME: torchvision v2 transforms treat a batched
+    tensor as a single sample with leading batch dims and draw one parameter set per call, so
+    passing [B, 3, H, W] straight through would give every image in the batch the same jitter/blur
+    and warp them all-or-none. That collapses the distance spread this pass exists to widen.
     """
 
     def __init__(self, img_size: int):
@@ -140,7 +145,8 @@ class _GpuAugBatch(torch.nn.Module):
         self.norm = transforms.Normalize(mean=MEAN, std=STD)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.norm(self.aug(x))
+        out = torch.stack([self.aug(img) for img in x])   # per-sample params, see class docstring
+        return self.norm(out)
 
 
 @torch.no_grad()
@@ -702,8 +708,10 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--data-dir', default=_DEFAULT_DATA_DIR, type=str,
                         help='dataset root containing train/ (and val/) subfolders')
-    parser.add_argument('--img-size', default=_DEFAULT_IMG_SIZE, type=int,
-                        help='square input size')
+    parser.add_argument('--img-size', default=None, type=int,
+                        help=f'square input size (default: {_DEFAULT_IMG_SIZE}). Ignored with '
+                             f'--load-onnx, which takes the size baked in at export from the '
+                             f'sidecar .meta.json.')
     parser.add_argument('--class-map', default='', type=str,
                         help='class-map file (one class name per line); its line count sets '
                              'num_classes. Required for the PyTorch/export path (not for --load-onnx).')
@@ -748,10 +756,13 @@ def main():
     parser.add_argument('--gpu-predict', action='store_true', default=False,
                         help='run prediction/verification on GPU (ONNX CUDA provider, TorchScript + '
                              'in-memory model on cuda). Default CPU, which mirrors the ncnn deployment '
-                             'target; batched decode is used either way')
+                             'target. Note: only the in-memory PyTorch path decodes in batches; the '
+                             'ONNX and TorchScript paths run one image at a time')
     args = parser.parse_args()
 
-    transform = build_transform(args.img_size)
+    # --img-size defaults lazily so --load-onnx can tell "user asked for N" from "user said nothing"
+    # and prefer the exported size without silently overriding an explicit request.
+    requested_img_size, args.img_size = args.img_size, args.img_size or _DEFAULT_IMG_SIZE
 
     # --- ONNX-only inference path ---
     if args.load_onnx:
@@ -765,8 +776,17 @@ def main():
         meta = json.load(open(meta_path))
         class_names = meta['class_names']
         no_argmin = meta.get('no_argmin', False)      # output format baked at export time
+        # Preprocessing must match what was baked in at export, not the CLI defaults: a wrong
+        # img_size fails loudly on shape, but a wrong mean/std fails SILENTLY with bad distances.
+        img_size = meta.get('img_size', args.img_size)
+        mean, std = meta.get('mean', MEAN), meta.get('std', STD)
+        if requested_img_size is not None and requested_img_size != img_size:
+            print(f'WARNING — ignoring --img-size {requested_img_size}; the model was exported at '
+                  f'{img_size} (from {meta_path})')
+        transform = build_transform(img_size, mean=mean, std=std)
         print(f'ONNX model : {args.load_onnx}')
         print(f'Classes    : {len(class_names)} (from {meta_path})')
+        print(f'Preprocess : {img_size}x{img_size}, mean={tuple(mean)}, std={tuple(std)} (from {meta_path})')
         print(f'Output     : {"dists/margins (client argmin)" if no_argmin else "scalar (in-graph argmin)"}\n')
         session = load_openset_onnx(args.load_onnx, use_gpu=args.gpu_predict)
         img_paths = [args.image] if args.image else _scan_eval_images(args.data_dir)
@@ -788,6 +808,7 @@ def main():
         return
 
     # --- PyTorch path ---
+    transform = build_transform(args.img_size)
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
     if not args.checkpoint:
         raise SystemExit('--checkpoint is required (or use --load-onnx for ONNX inference)')
