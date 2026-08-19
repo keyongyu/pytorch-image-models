@@ -180,9 +180,30 @@ sh nptools/train_posm.sh \
   timm `state_dict`; the ArcFace head is training-only. Turn it off with `--no-arcface`.
 - **`--per-class-acc` is on by default** too — per-class top-1, which is how look-alike classes get
   spotted. Turn it off with `--no-per-class-acc`.
+- **`--amp --channels-last` are on by default.** fp16 mixed precision keeps fp32 master weights and
+  loss-scales the gradients, so accuracy is unaffected, and the export is untouched (`openset.py`
+  rebuilds the model and loads fp32 weights). Disable with `--no-amp`; if the ArcFace margin logits
+  ever produce NaN losses, pass `--amp-dtype bfloat16` through.
+- **The split is pre-resized before training, always.** `nptools/resize_dataset.py` writes a sibling
+  `<data-dir>_<2N>` tree (squashed to `2N × 2N`, where N is `--resize`, default 224) and training
+  reads that. This is not a shortcut: `npaug` normalises every sample to a `2*img_size` canvas, so
+  nothing above it survives — and decoding full-resolution sources each epoch cost **10.5 ms of the
+  14.3 ms** per-sample budget, more than the entire augmentation. Measured: the 16-worker loader goes
+  941.8 → 1820.0 img/s and the split shrinks 1705 MB → 879 MB, built in ~8 s.
+  Originals are never modified, `imbaldup_*` symlinks from step 6 are relinked (not duplicated), and
+  `nobg_*.png` cutouts keep PNG + alpha. Re-runs are mtime-checked, so only changed images are rewritten.
+- **`--resize N`** (default 224) is the single size knob: it is the model input size passed to
+  `train.py --img-size`, it fixes the pre-resize target at `2N`, and it fills in the sizes in the
+  export commands printed at the end of the run. Keep it consistent across training and export.
+- **`--workers`** is derived as 2/3 of the **physical** cores, not `nproc`: this augmentation is
+  compute-bound, so SMT siblings only contend. Measured on a 24C/48T box, 32 workers was *slower*
+  than 16 (418 vs 576 img/s). Override with `WORKERS=N` in the environment.
 - `--new` starts from the pretrained backbone; without it the script resumes the latest
   `last.pth.tar` under the output dir.
-- Checkpoints land in `<DATA>/output/<timestamp>/`; use `model_best.pth.tar` next.
+- Checkpoints land in `<DATA>/output/<timestamp>/`; use `model_best.pth.tar` next. **When training
+  finishes the script prints the exact `openset.py` export command and the `pnnx` follow-up**, with
+  the run directory, class-map, `--data-dir` and sizes already filled in — steps 8 and 9 below
+  explain what those commands do, but you can copy them straight from the run output.
 
 ---
 
@@ -198,16 +219,37 @@ uv run python nptools/openset.py \
     --data-dir <DATA> --class-map <DATA>/class_84.txt \
     --ck <DATA>/output/<run>/model_best.pth.tar --calibrate
 
-# export (the threshold is calibrated automatically -- there is nothing to pass)
+# export both formats in ONE run (shared prototype pass, and both artifacts then carry the
+# same prototypes and the same calibrated threshold -- a second run would recalibrate)
 uv run python nptools/openset.py \
     --data-dir <DATA> \
     --class-map <DATA>/class_84.txt \
     --ck <DATA>/output/<run>/model_best.pth.tar \
-    --no-argmin --export-pt nptools/openset.pt   # stock-ncnn-friendly export (or --export-onnx)
+    --img-size 224 \
+    --no-argmin \
+    --export-pt <DATA>/output/<run>/openset.pt \
+    --export-onnx <DATA>/output/<run>/openset.onnx
 ```
+
+`train_posm.sh` prints this command with every path filled in when training ends, so prefer copying
+it from there over retyping it.
+
+Two things that are easy to get wrong and do **not** fail loudly:
+- **`--data-dir` here is not `train.py`'s.** `openset.py` wants the directory that *contains*
+  `train/`; if you pointed training straight at the class-folder root, pass its **parent**. Point it
+  at the **originals**, not the pre-resized copy from step 7 — prototypes and the threshold must come
+  from the images a deployed client will actually see.
+- **`--img-size` must match training.** `openset.py` defaults to 224 independently of the wrapper, so
+  training at another size and exporting without it extracts prototypes at one scale while the client
+  feeds another. The size is baked into the graph and recorded in the sidecar, so accuracy just
+  quietly drops.
 
 What happens:
 - **Prototypes** come from clean `train/<class>/` images (class-map only; `others` never read).
+- **One prototype per class-map entry.** A class with no usable images gets a **zero** prototype
+  rather than being dropped, so class indices always match the class-map file; those columns score a
+  constant `dist = 1.0` and can never match. Their names land in `meta.json` as `empty_classes`.
+  (Dropping them, as older exports did, silently shifted every index after the first gap.)
 - **One constant threshold** is applied to every class. Per-class thresholds were removed after
   measurement: they overfit 3.8× worse on held-out data, and the old quantile values were tight
   enough to falsely reject ~13–15% of real product images.
@@ -232,14 +274,25 @@ Turn the exported `.pt` (or `.onnx`) into ncnn files for on-device deployment. I
 once, then run pnnx with the model's input shape:
 
 ```bash
-uv pip install pnnx ncnn                                   # once
-cd nptools && pnnx openset.pt inputshape=[1,3,224,224]     # or: pnnx openset.onnx inputshape=[1,3,224,224]
-#   → openset.ncnn.param + openset.ncnn.bin   (+ openset.ncnn.py, and openset.pt.meta.json from step 8)
+uv pip install pnnx ncnn                                   # once (not a project dependency)
+uv run pnnx <DATA>/output/<run>/openset.pt inputshape=[1,3,224,224]
+#   → openset.ncnn.param + openset.ncnn.bin   (+ openset_ncnn.py and the openset.pnnx.* intermediates,
+#     all written NEXT TO the .pt, so they land in the run dir beside the checkpoint)
 ```
 
+`train_posm.sh` prints this line too, with the path and `inputshape` already matching `--resize`.
+
+- **`inputshape` must match the exported `--img-size`.** pnnx traces at that shape and
+  constant-folds `Conv2dSame`'s dynamic padding against it, so a wrong value bakes wrong padding
+  into the `.param` instead of failing.
 - **Export with `--no-argmin` (step 8) for a stock ncnn wheel.** That graph is just
   `Normalize → matmul → subtract` and converts/runs as-is; the client does the `argmin` + reject.
   The default (in-graph argmin) export emits ops a stock wheel can't run and needs a custom layer.
+- Verified on a `--no-argmin` export: the resulting `.param` is 76 layers of `Convolution`,
+  `ConvolutionDepthWise`, `BinaryOp`, `Split`, `Pooling`, `Reshape`, `Flatten`, **one** `Normalize`
+  and **one** `InnerProduct` — zero `ArgMin`/`ArgMax`/`Gather`/`Crop`. ncnn output matches
+  TorchScript to ~4e-3 on `dists` (fp32 kernel differences, three orders below the 0.46 threshold),
+  with identical decisions on every image tested.
 - The TorchScript route (`.pt`) usually yields a leaner ncnn graph than the ONNX route; both give the
   same model. Useful pnnx args: `fp16=1` (default), `optlevel=2`.
 - Blob names (input `in0`, outputs `out0`=`dists`/`out1`=`margins`) are in the top of
@@ -286,12 +339,13 @@ uv run python nptools/extract_object.py --video-folder <DATA>/<class>videos --de
 # 4. class map: one class per line (omit 'others')
 # 6. reduce class imbalance (symlink-oversample minority classes)
 python -m nptools.reduce_imbalance --data-dir <DATA> --split train
-# 7. train ArcFace
-sh nptools/train_posm.sh --data-dir <DATA> --class-map <DATA>/class_84.txt --new   # arcface on by default
+# 7. train ArcFace (arcface + per-class-acc + amp on by default; split auto-resized to 2*224)
+sh nptools/train_posm.sh --data-dir <DATA> --class-map <DATA>/class_84.txt --new
+#    ...and copy the two commands it prints when it finishes, which are steps 8 and 9 pre-filled:
 # 8. build + export open-set model (threshold is calibrated automatically)
 uv run python nptools/openset.py --data-dir <DATA> --class-map <DATA>/class_84.txt \
-    --ck <DATA>/output/<run>/model_best.pth.tar \
-    --no-argmin --export-pt nptools/openset.pt
-# 9. convert to ncnn
-cd nptools && pnnx openset.pt inputshape=[1,3,224,224]      # → openset.ncnn.param + .bin
+    --ck <DATA>/output/<run>/model_best.pth.tar --img-size 224 --no-argmin \
+    --export-pt <DATA>/output/<run>/openset.pt --export-onnx <DATA>/output/<run>/openset.onnx
+# 9. convert to ncnn (outputs land next to the .pt)
+uv run pnnx <DATA>/output/<run>/openset.pt inputshape=[1,3,224,224]   # → openset.ncnn.param + .bin
 ```

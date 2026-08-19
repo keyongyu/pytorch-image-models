@@ -70,7 +70,7 @@ class-map defines which classes to use, in what order, and — via its line coun
 | `--class-map PATH` | **yes** (PyTorch/export path) | class-map file, one class name per line. Its **line count = `num_classes`**, and its **order = class index order**. Not needed for `--load-onnx`. |
 | `--checkpoint PATH` / `--ck` | **yes** (PyTorch/export path) | the trained checkpoint to load (`--ck` is a short alias) |
 | `--data-dir DIR` | no (default posmlv) | dataset root with `train/`, `val/`, `test/` subfolders |
-| `--img-size N` | no (default 224) | square input size |
+| `--img-size N` | no (default 224) | square input size. **Must match what was trained** — this default is independent of `train_posm.sh`, and a mismatch does not error: the size is baked into the exported graph and recorded in the sidecar, so prototypes get extracted at one scale while the client feeds another and accuracy quietly drops. `train_posm.sh` fills this in for you in the export command it prints. |
 | `--min-threshold M` | no (default 0.2) | floor on the calibrated threshold. A suggestion below it is clamped up and warned about, since a tiny threshold rejects genuine products (0.02 costs ~10% false-reject on posmlv) while barely reducing false-accepts. |
 | `--calibrate` | no (default off) | **report-only**: print the false-reject / false-accept sweep and exit *without* exporting. The same calibration runs on every export anyway, so this is for inspecting the curve (§2.2). |
 | `--aug` / `--no-aug` | no (default `--aug`) | during calibration, probe with **npaug-augmented** views so the in-distribution spread reflects real variation instead of near-duplicate video frames (prototypes stay clean); `--no-aug` probes the clean crops with leave-one-image-out instead |
@@ -101,11 +101,23 @@ uv run --no-sync python nptools/openset.py --load-onnx model.onnx --image x.jpg
 ```
 
 Notes:
-- **Class-map drives prototype building.** Only classes listed in the class-map are used, in that
-  order. A class-map entry with **no folder** or an **empty folder** is warned about and skipped;
-  a class with **< 10 images** is warned (prototype may be unreliable) but still used.
-  Folders **not** in the class-map are ignored. So the exported model may have **fewer** classes
-  than the class-map (skipped ones); `meta.json` records the exact final list.
+- **Class-map drives prototype building, one prototype per entry.** Only classes listed in the
+  class-map are used, in that order, and the exported model has **exactly as many columns as the
+  class-map has entries** — so a class index means the same thing in the class-map file, the
+  exported matrix, and the client. A class with **< 10 images** is warned (prototype may be
+  unreliable) but still used. Folders **not** in the class-map are ignored.
+- **Classes with no usable images get a zero prototype**, not a dropped column. "No usable images"
+  means the folder is missing, the folder is empty, or every image was an outlier; each case is
+  warned about, and the names are listed in `meta.json` as `empty_classes`.
+  Zero is the *correct* sentinel here, not just a convenient one: the pre-logits feature is
+  post-ReLU6 and therefore non-negative, so cosine similarity lies in [0, 1] and cosine distance
+  in [0, 1] (measured max 1.0000 over 1800 images). A zero row scores `sims = 0`, i.e.
+  `dist == 1.0` — the **maximum attainable distance** — so it can never strictly win the argmin
+  against a class that has data, and if it ever tied at 1.0 the margin (`1.0 − threshold`) is
+  positive, so the verdict is `unknown` anyway. It survives PNNX → ncnn as exactly `1.0`, because a
+  zero weight row makes the dot product identically zero regardless of kernel path.
+  Dropping such classes instead (as this used to do) shifted every index after the first gap, which
+  a client cannot recover from — it has only the class-map file to index with.
 - **The threshold is one constant, and it is always calibrated.** There is no way to pin a value:
   a hand-set threshold goes stale silently the moment the checkpoint or the class set changes, and
   nothing in the artifact would reveal it. The clean feature pass is shared between calibration and
@@ -148,8 +160,13 @@ Notes:
   {"class_names": [...], "threshold": 0.46, "img_size": 224,
    "mean": [0.5,0.5,0.5], "std": [0.5,0.5,0.5], "resize": "area", "no_argmin": true,
    "threshold_source": "calibrated", "threshold_frr": 0.0011, "threshold_far": 0.0007,
-   "threshold_plateau": [0.166, 0.7637], "threshold_floor": 0.2}
+   "threshold_plateau": [0.166, 0.7637], "threshold_floor": 0.2,
+   "empty_classes": ["posm_14", "posm_44"]}
   ```
+  `class_names` is the **full class-map order**, one entry per exported column; `empty_classes` (only
+  present when there are any) names the ones with no training images, whose column is a zero
+  prototype that always scores `dist = 1.0` and therefore never matches — report those as "no data"
+  rather than as a product.
   `threshold` is a **scalar** (it used to be a per-class list — see the breaking-change note in §5);
   `resize` names the downscale filter the client should use; `no_argmin` records which output format
   was baked in. The `threshold_*` provenance fields are always present, since every export
@@ -366,6 +383,11 @@ The graph does the `argmin` + gather itself, so the client just reads the scalar
 | `dists` | `[1, C]` | float32 | cosine distance to **every** class prototype |
 | `margins` | `[1, C]` | float32 | `dists[c] − threshold` (same constant for every c) |
 
+**C is the class-map line count**, not the number of classes that had images — data-less classes
+occupy their column with a zero prototype and score a constant `dist = 1.0` (see §2 notes). So the
+client indexes straight into the class-map order, and `meta['empty_classes']` names the columns that
+can never match.
+
 The graph stops at the vectors; the client does `best = argmin(dists)`, `unknown = margins[best] > 0`.
 Only conv, L2-normalize, matmul and subtract remain — all universally supported — so it **converts
 and runs on a stock ncnn wheel**. Recommended unless you specifically need the model to emit the
@@ -390,19 +412,29 @@ uv pip install pnnx ncnn        # (onnx already present for the ONNX route)
 
 ```bash
 uv run --no-sync python nptools/openset.py --export-pt nptools/openset.pt
-cd nptools && pnnx openset.pt inputshape=[1,3,224,224]
-#   → openset.ncnn.param + openset.ncnn.bin   (plus openset.pt.meta.json from the export)
+uv run pnnx nptools/openset.pt inputshape=[1,3,224,224]
+#   → openset.ncnn.param + openset.ncnn.bin, written NEXT TO the .pt (no cd needed), plus
+#     openset_ncnn.py and the openset.pnnx.* intermediates, and openset.pt.meta.json from the export
 ```
 
 PNNX's native TorchScript path skips the ONNX intermediate, so it usually emits **fewer ncnn
 layers** (no ONNX shape-tracking `Gather/Unsqueeze/Reshape` clutter around the normalize/matmul
-head).
+head). `inputshape` must match the exported `--img-size`: pnnx traces at that shape and
+constant-folds `Conv2dSame`'s dynamic padding against it, so a wrong value bakes wrong padding into
+the `.param` rather than failing.
+
+Measured on a `--no-argmin` export of `tf_efficientnet_lite0` (83 classes): 76 layers — 33
+`Convolution`, 16 `ConvolutionDepthWise`, 11 `BinaryOp`, 10 `Split`, and one each of `Pooling`,
+`Reshape`, `Flatten`, `Normalize`, `InnerProduct`, `Input` — with **zero**
+`ArgMin`/`ArgMax`/`Gather`/`Crop`, 494 MFLOPs. ncnn matches TorchScript to ~4e-3 on `dists` (fp32
+kernel differences; the decision boundary sits three orders of magnitude away), with identical
+labels on every image tested.
 
 ### Route B — via ONNX: PyTorch → ONNX → ncnn
 
 ```bash
 uv run --no-sync python nptools/openset.py --export-onnx nptools/openset.onnx
-cd nptools && pnnx openset.onnx inputshape=[1,3,224,224]     # pnnx's ONNX frontend
+uv run pnnx nptools/openset.onnx inputshape=[1,3,224,224]     # pnnx's ONNX frontend
 #   (or the older: onnx2ncnn openset.onnx openset.ncnn.param openset.ncnn.bin)
 ```
 
@@ -511,7 +543,10 @@ Client rules:
 2. **Decision:** `best = argmin(dists)`; `margins[best] > 0` (equivalently `dists[best] >
    meta['threshold']`) ⇒ **reject as unknown**; otherwise the product is `class_names[best]`. The
    threshold is already baked into `margins`, so the client just checks the sign at the nearest class.
-3. **Index → name** via `meta.json`'s `class_names` (order matches the exported prototype matrix).
+3. **Index → name** via `meta.json`'s `class_names`, which is the full class-map order and matches
+   the exported prototype matrix column for column. A name listed in `meta['empty_classes']` has no
+   training data behind it and can only appear as a rejection, so surface it as "no data" if it ever
+   comes back as `best`.
 4. **Retuning the threshold without re-export:** it is baked into `margins`, so to adjust without
    re-exporting, ignore `margins` and apply your own rule on `dists`, e.g.
    `dists[best] > my_threshold`.
@@ -520,6 +555,12 @@ Client rules:
 > class). It now carries a single scalar **`threshold`**, because calibration showed per-class
 > thresholds overfit badly (3.8× worse on held-out data). Clients reading `meta['thresholds'][i]`
 > must switch to `meta['threshold']`. The graph outputs are unchanged.
+>
+> **Breaking change:** the output vectors now have **one column per class-map entry**, where they
+> used to have one per class that had images (on posmlvx: 83 instead of 71). Index with the full
+> class-map order and treat `meta['empty_classes']` as never-matching. Models exported before this
+> change are misaligned against the current class map and must be re-exported — the shift starts at
+> the first data-less class, so early indices look correct, which makes it easy to miss.
 
 ---
 
@@ -577,7 +618,7 @@ uv run --no-sync python nptools/openset.py \
     --no-argmin --export-pt nptools/openset.pt  # (or --export-onnx)
 
 # 2. convert to ncnn
-cd nptools && pnnx openset.pt inputshape=[1,3,224,224]                       # → openset.ncnn.*
+uv run pnnx nptools/openset.pt inputshape=[1,3,224,224]                       # → openset.ncnn.*
 
 # 3. client: preprocess (squash 224 + mean/std 0.5) → run → best=argmin(dists) →
 #    margins[best]>0 ⇒ unknown ; else class_names[best]  (names/threshold in openset.pt.meta.json)
