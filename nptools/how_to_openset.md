@@ -214,10 +214,11 @@ per class, resolves a **single constant reject threshold** shared by every class
 deployable model.
 
 ```bash
-# optional first: inspect the false-reject / false-accept tradeoff without exporting
+# optional first: inspect the false-reject / false-accept tradeoff without writing anything --
+# calibration always runs, so simply omit the --export-* flags
 uv run python nptools/openset.py \
     --data-dir <DATA> --class-map <DATA>/class_84.txt \
-    --ck <DATA>/output/<run>/model_best.pth.tar --calibrate
+    --ck <DATA>/output/<run>/model_best.pth.tar
 
 # export both formats in ONE run (shared prototype pass, and both artifacts then carry the
 # same prototypes and the same calibrated threshold -- a second run would recalibrate)
@@ -311,23 +312,41 @@ uv run python nptools/openset.py --load-onnx nptools/openset.onnx --image sample
 
 Decision at inference: nearest prototype by cosine distance; if `dist > threshold` → **unknown /
 new product**, else the matched class. Sanity-check that real products in `val/`/`test/` are
-accepted; if you kept an `others/` set (step 3), confirm its items are rejected. Re-run
-`--calibrate` to inspect the tradeoff; every export recalibrates, so re-exporting is how you pick
-up a corrected value after fixing data.
+accepted; if you kept an `others/` set (step 3), confirm its items are rejected. Re-run without
+the `--export-*` flags to inspect the tradeoff; every export recalibrates, so re-exporting is how
+you pick up a corrected value after fixing data.
 
 ---
 
 ## 11. Enroll a new product later (no retraining)
 
-The ArcFace embedding generalizes, so adding a product usually needs **no retrain**:
-1. add its cutouts under `train/<newclass>/` (step 2),
-2. add its name to the class-map (step 4),
-3. rebuild/export prototypes (step 8).
+Adding a product needs no retrain, because the decision uses the **embedding**, not the classifier
+head: a new class needs a prototype, not a new output neuron.
 
-The new class gets a prototype from a handful of images and inherits the shared threshold; retrain
-the backbone only if accuracy on the new class is poor. Re-running `--calibrate` after enrolling is
-cheap and worthwhile — leave-one-class-out is exactly the "a product I have not enrolled yet"
-scenario, so it measures the case this step creates.
+1. add its cutouts under `train/<newclass>/` (step 2),
+2. add its name to the class-map (step 4) — **append**, don't reorder: existing indices must not move,
+3. rebuild/export prototypes (step 8), pointing `--checkpoint` at the **same** checkpoint as before.
+
+The new class gets a prototype from a handful of images and inherits the shared threshold. The
+class-map may now be longer than the checkpoint's classifier; that is fine, `openset.py` sizes the
+head from the checkpoint and prints a note, because the head is a training artifact it never reads.
+(Before that fix this step failed outright with `size mismatch for classifier.weight`.)
+
+Then **verify the new class explicitly**, because nothing above measures it:
+
+- do its own images land close to its new prototype? The export log prints
+  `<class>: N imgs, mean=…, max=…` — compare that mean against the other classes (on posmlvx the
+  trained classes sit at ~0.005–0.013); a visibly larger mean means the embedding does not separate
+  this product, and *that* is when to retrain the backbone.
+- is it distinct from its look-alikes? A near-duplicate SKU shows up in `outlier/outlier.txt` as a
+  `nearest_type` pointing at the new class, or vice versa.
+
+Re-running the calibration report (the same command without `--export-*`) is cheap and worth doing,
+since the threshold should be re-measured whenever the class set changes. Note what it does and does
+not tell you: its negatives come from **leave-one-class-out**, i.e. scoring a class's images with its
+own prototype masked, which measures *rejecting a product you have not enrolled* — the situation this
+step removes. It does not measure whether the newly enrolled class is correctly **accepted**; only
+the two checks above do.
 
 ---
 

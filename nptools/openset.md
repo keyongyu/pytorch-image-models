@@ -17,7 +17,7 @@ How it works here (feature-prototype / metric approach):
 ```
       ┌──────────── build once, from training data (classes from class-map) ─────┐
       │  for each class: mean of its pre-logits features → prototype (L2-norm)   │
-      │  ONE constant reject threshold, always calibrated (floor 0.2)           │
+      │  ONE constant reject threshold, always calibrated (floor 0.2)            │
       └──────────────────────────────────────────────────────────────────────────┘
 
   image ─► backbone ─► pre-logits feature (1280-d) ─► L2 normalize
@@ -54,7 +54,7 @@ set to the `--quantile` of that class's own training distances. Measurement reti
 Geometrically there is nothing for a per-class threshold to exploit: ArcFace drives prototypes to
 near-orthogonality (nearest-competitor distance min 0.89, median 0.96), positives sit at ~0.007 and
 negatives at ~0.93. Every class needs the same thing — a cut somewhere in that large empty gap.
-Pick it with `--calibrate` (§2.2).
+It is measured on every run, not guessed (§2.2).
 
 ---
 
@@ -72,10 +72,9 @@ class-map defines which classes to use, in what order, and — via its line coun
 | `--data-dir DIR` | no (default posmlv) | dataset root with `train/`, `val/`, `test/` subfolders |
 | `--img-size N` | no (default 224) | square input size. **Must match what was trained** — this default is independent of `train_posm.sh`, and a mismatch does not error: the size is baked into the exported graph and recorded in the sidecar, so prototypes get extracted at one scale while the client feeds another and accuracy quietly drops. `train_posm.sh` fills this in for you in the export command it prints. |
 | `--min-threshold M` | no (default 0.2) | floor on the calibrated threshold. A suggestion below it is clamped up and warned about, since a tiny threshold rejects genuine products (0.02 costs ~10% false-reject on posmlv) while barely reducing false-accepts. |
-| `--calibrate` | no (default off) | **report-only**: print the false-reject / false-accept sweep and exit *without* exporting. The same calibration runs on every export anyway, so this is for inspecting the curve (§2.2). |
 | `--aug` / `--no-aug` | no (default `--aug`) | during calibration, probe with **npaug-augmented** views so the in-distribution spread reflects real variation instead of near-duplicate video frames (prototypes stay clean); `--no-aug` probes the clean crops with leave-one-image-out instead |
-| `--aug-views N` | no (default 2) | augmented probe views per image during calibration |
-| `--aug-max-per-class N` | no (default 100) | cap on probe images per class during calibration; `0` = use all |
+| `--aug-views N` | no (default 3) | augmented probe views per image during calibration |
+| `--aug-max-per-class N` | no (default 200) | cap on probe images per class during calibration; `0` = use all |
 | `--cpu-aug` | no (default off) | use CPU npaug (albumentations) instead of GPU torchvision for the aug probe — faithful to training augmentation, much slower |
 | `--copy-inliers` | no (default off) | while building prototypes, also copy the **good inlier** crops (cosine dist ≤ 0.5 to their class prototype) into `<data-dir>/inlier/<class>/` — a cleaned training set (see §2.1) |
 | `--gpu-predict` | no (default **CPU**) | run **prediction/verification** on GPU (ONNX `CUDAExecutionProvider`, TorchScript + in-memory model on `cuda`). Default is CPU so verification mirrors the ncnn deployment target. **Prototype building always uses the GPU** regardless of this flag; it only affects the predict/verify pass. |
@@ -88,16 +87,16 @@ class-map defines which classes to use, in what order, and — via its line coun
 ```bash
 # Classify val/ + test/ images with the PyTorch prototypes (no export).
 # Still calibrates first — that happens on every run that builds prototypes.
-uv run --no-sync python nptools/openset.py \
+uv run python nptools/openset.py \
     --data-dir posmlv --class-map posmlv/class_84.txt --checkpoint <run>/model_best.pth.tar
 
 # Export the open-set model (then it self-verifies by predicting THROUGH the exported model)
-uv run --no-sync python nptools/openset.py \
+uv run python nptools/openset.py \
     --data-dir posmlv --class-map posmlv/class_84.txt --checkpoint <run>/model_best.pth.tar \
     --export-onnx model.onnx        # or --export-pt model.pt
 
 # Predict through an already-exported ONNX model (CPU), no prototype rebuild
-uv run --no-sync python nptools/openset.py --load-onnx model.onnx --image x.jpg
+uv run python nptools/openset.py --load-onnx model.onnx --image x.jpg
 ```
 
 Notes:
@@ -261,7 +260,7 @@ the 0.5 gate); the tightest crops sit at the top when sorted ascending.
 
 ```bash
 # Audit + emit a cleaned training set in one pass (no export needed)
-uv run --no-sync python nptools/openset.py \
+uv run python nptools/openset.py \
     --data-dir posmlv --class-map posmlv/class_84.txt \
     --checkpoint <run>/model_best.pth.tar --copy-inliers
 #   → posmlv/outlier/<class>/…   (crops to review / drop)
@@ -285,15 +284,17 @@ Notes:
 
 ---
 
-## 2.2 Choosing the threshold — `--calibrate`
+## 2.2 Choosing the threshold — always measured, never passed
 
-The threshold is one number, so it is worth measuring rather than guessing. `--calibrate` sweeps
-candidates and prints what each one actually costs, then exits without exporting.
+The threshold is one number, so it is measured rather than guessed, and there is no flag to pin or
+to skip it: every run that builds prototypes sweeps candidates, prints what each one costs, and
+bakes the chosen value into the export. To read the curve **without writing artifacts, just omit
+`--export-pt`/`--export-onnx`**:
 
 ```bash
-uv run --no-sync python nptools/openset.py \
+uv run python nptools/openset.py \
     --data-dir posmlv --class-map posmlv/class_84.txt \
-    --ck <run>/model_best.pth.tar --calibrate
+    --ck <run>/model_best.pth.tar
 ```
 
 **No curated negative set is needed** — which matters, because a folder of assorted non-target
@@ -340,7 +341,8 @@ Three caveats it prints with the table:
 - The midpoint weights false-reject and false-accept equally, and there is no flag to bias it.
 
 Every export runs this same sweep automatically and bakes the suggestion in, recording the
-provenance in `meta.json`. `--calibrate` just stops before exporting so you can read the curve.
+provenance in `meta.json`. Omitting the `--export-*` flags stops before writing anything, so you
+can read the curve without producing an artifact.
 `--min-threshold` can only raise the floor (more permissive); there is currently no way to bias the
 choice toward a stricter value.
 
@@ -411,7 +413,7 @@ uv pip install pnnx ncnn        # (onnx already present for the ONNX route)
 ### Route A — direct: TorchScript → ncnn  (leaner graph, recommended)
 
 ```bash
-uv run --no-sync python nptools/openset.py --export-pt nptools/openset.pt
+uv run python nptools/openset.py --export-pt nptools/openset.pt
 uv run pnnx nptools/openset.pt inputshape=[1,3,224,224]
 #   → openset.ncnn.param + openset.ncnn.bin, written NEXT TO the .pt (no cd needed), plus
 #     openset_ncnn.py and the openset.pnnx.* intermediates, and openset.pt.meta.json from the export
@@ -433,7 +435,7 @@ labels on every image tested.
 ### Route B — via ONNX: PyTorch → ONNX → ncnn
 
 ```bash
-uv run --no-sync python nptools/openset.py --export-onnx nptools/openset.onnx
+uv run python nptools/openset.py --export-onnx nptools/openset.onnx
 uv run pnnx nptools/openset.onnx inputshape=[1,3,224,224]     # pnnx's ONNX frontend
 #   (or the older: onnx2ncnn openset.onnx openset.ncnn.param openset.ncnn.bin)
 ```
@@ -605,14 +607,15 @@ unless your app framework must have the model emit the final decision.
 ## TL;DR (recommended: `--no-argmin`, runs on stock ncnn)
 
 ```bash
-# 0. (optional) see what each threshold costs, on your own data, no negatives needed
-uv run --no-sync python nptools/openset.py \
+# 0. (optional) see what each threshold costs, on your own data, no negatives needed:
+#    same command as below minus the --export-* flags, so nothing is written
+uv run python nptools/openset.py \
     --data-dir posmlv --class-map posmlv/class_84.txt \
-    --ck <run>/model_best.pth.tar --calibrate
+    --ck <run>/model_best.pth.tar
 
 # 1. build open-set model from checkpoint + training data (classes from class-map), export it
 #    the threshold is always calibrated automatically -- there is nothing to pass
-uv run --no-sync python nptools/openset.py \
+uv run python nptools/openset.py \
     --data-dir posmlv --class-map posmlv/class_84.txt \
     --checkpoint <run>/model_best.pth.tar \
     --no-argmin --export-pt nptools/openset.pt  # (or --export-onnx)

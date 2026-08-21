@@ -4,22 +4,23 @@ Uses the pre-logits feature (pooled vector before the FC layer) and cosine dista
 to per-class mean prototypes. A test image whose nearest prototype is farther than a
 threshold is rejected as 'unknown'.
 """
-import os
-import glob
-import shutil
-from pathlib import Path
-import time
 import argparse
+import glob
+import os
+import shutil
+import time
+from pathlib import Path
 
+import cv2
 import numpy as np
+import onnx
+import onnxruntime as ort
 import torch
 import torch.nn.functional as F
-import timm
-import onnxruntime as ort
-import onnx
-import cv2
-from timm.models import load_checkpoint
 from torchvision import transforms
+
+import timm
+from timm.models import load_checkpoint
 
 try:
     # Optional: shell tab-completion of main()'s flags. Note the shell hook has to be registered
@@ -75,8 +76,29 @@ def _write_aligned_csv(path, header, rows) -> None:
     table = [tuple(header)] + [tuple(r) for r in rows]
     widths = [max(len(row[c]) for row in table) for c in range(len(header))]
     with open(path, 'w') as f:
-        for row in table:
-            f.write(', '.join(cell.ljust(widths[c]) for c, cell in enumerate(row)).rstrip() + '\n')
+        f.writelines(', '.join(cell.ljust(widths[c]) for c, cell in enumerate(row)).rstrip() + '\n' for row in table)
+
+
+def _checkpoint_num_classes(path: str, default: int) -> int:
+    """Width of the classifier stored in `path`, so the model can be built to match it.
+
+    Open-set never uses the classifier, but strict state_dict loading still rejects a width
+    mismatch, so this is what lets the class-map grow (enrolling a product) without retraining.
+    Falls back to `default` for a checkpoint with no recognisable head.
+    """
+    sd = torch.load(path, map_location='cpu', weights_only=False)
+    for key in ('state_dict_ema', 'state_dict', 'model'):
+        if isinstance(sd, dict) and key in sd and isinstance(sd[key], dict):
+            sd = sd[key]
+            break
+    if not isinstance(sd, dict):
+        return default
+    for name in ('classifier.weight', 'head.fc.weight', 'head.weight', 'fc.weight'):
+        for k in (name, f'module.{name}'):
+            w = sd.get(k)
+            if w is not None and hasattr(w, 'shape') and len(w.shape) >= 1:
+                return int(w.shape[0])
+    return default
 
 
 def _read_class_names(class_map_path: str) -> list:
@@ -255,7 +277,7 @@ class _FeatDataset(torch.utils.data.Dataset):
         path, cls = self.samples[i]
         try:
             return self.transform(path), cls
-        except (IOError, OSError, cv2.error):
+        except (OSError, cv2.error):
             return torch.zeros(3, self.img_size, self.img_size, dtype=self.out_dtype), -1
 
 
@@ -446,8 +468,8 @@ def build_prototypes(model, transform, device: str, data_dir: str, img_size: int
     Every class gets the SAME reject threshold (`threshold`). Per-class thresholds taken from each
     class's own training spread were removed: with one video per class the training crops are
     near-duplicate frames, so that spread measures how the clip happened to be shot rather than how
-    the product varies, and it never sees a negative at all. Use `calibrate_threshold`
-    (`--calibrate`) to choose the constant from measured false-reject / false-accept rates.
+    the product varies, and it never sees a negative at all. `calibrate_threshold` chooses the
+    constant from measured false-reject / false-accept rates, and main() always runs it.
 
     If `copy_inliers` is set, the good inlier crops (cosine dist <= OUTLIER_THR to their class
     prototype) are copied into `<data_dir>/inlier/<class>/` for training a clean classifier.
@@ -597,7 +619,7 @@ def _loo_positive_dists(feats: torch.Tensor) -> torch.Tensor:
 @torch.no_grad()
 def calibrate_threshold(model, transform, device: str, data_dir: str, img_size: int,
                         class_map_names, batch_size: int = 64, num_workers: int = 16,
-                        aug: bool = True, aug_views: int = 2, aug_max_per_class: int = 100,
+                        aug: bool = True, aug_views: int = 3, aug_max_per_class: int = 200,
                         cpu_aug: bool = False, seed: int = 0, feats: dict | None = None,
                         min_threshold: float = DEFAULT_MIN_THRESHOLD):
     """Sweep candidate constant thresholds, reporting MEASURED false-reject / false-accept rates.
@@ -1085,20 +1107,15 @@ def main():
              f'false-accepts. Lower it only if you know the low value is real.',
     )
     parser.add_argument(
-        '--calibrate', action='store_true', default=False,
-        help='report-only: print the false-reject / false-accept sweep and exit WITHOUT exporting. '
-             'The same calibration runs on every export, so this is for inspecting the curve.',
-    )
-    parser.add_argument(
         '--aug', action=argparse.BooleanOptionalAction, default=True,
-        help='during --calibrate, probe with npaug-augmented views so the in-distribution spread '
+        help='during calibration, probe with npaug-augmented views so the in-distribution spread '
              'reflects real variation instead of near-duplicate video frames (prototypes stay '
              'clean); --no-aug probes with the clean crops and leave-one-image-out instead',
     )
-    parser.add_argument('--aug-views', default=2, type=int,
-                        help='augmented probe views per image during --calibrate (default: 2)')
-    parser.add_argument('--aug-max-per-class', default=100, type=int,
-                        help='max images per class for the aug probe pass (default: 100); 0 = use all')
+    parser.add_argument('--aug-views', default=3, type=int,
+                        help='augmented probe views per image during calibration (default: 3)')
+    parser.add_argument('--aug-max-per-class', default=200, type=int,
+                        help='max images per class for the aug probe pass (default: 200); 0 = use all')
     parser.add_argument('--cpu-aug', action='store_true', default=False,
                         help='use CPU npaug (albumentations) instead of GPU torchvision for the aug probe')
     parser.add_argument('--copy-inliers', action='store_true', default=False,
@@ -1146,7 +1163,7 @@ def main():
         print(f'Output     : {"dists/margins (client argmin)" if no_argmin else "scalar (in-graph argmin)"}\n')
         session = load_openset_onnx(args.load_onnx, use_gpu=args.gpu_predict)
         img_paths = [args.image] if args.image else _scan_eval_images(args.data_dir)
-        print(f'  prediction via ONNX model')
+        print('  prediction via ONNX model')
         n_correct = 0
         for img_path in img_paths:
             label, dist, nearest = predict_onnx(session, transform, class_names, img_path,
@@ -1177,7 +1194,19 @@ def main():
     class_map_names = _read_class_names(args.class_map)
     num_classes = len(class_map_names)
     print(f'Classes (from {args.class_map}): {num_classes}')
-    model = timm.create_model(MODEL_NAME, num_classes=num_classes, pretrained=False)
+    # Size the classifier from the CHECKPOINT, not the class-map. The head is a training artifact
+    # that open-set never reads (decisions come from the pre-logits feature), but it still has to
+    # load, and strict loading fails on a shape mismatch -- so deriving its width from the class-map
+    # made enrolling a new product impossible: adding one line to the map and re-exporting died with
+    # "size mismatch for classifier.weight" on a tensor about to be ignored. The class-map's job is
+    # to say WHICH prototypes to build and in what order, which it still does.
+    head_classes = _checkpoint_num_classes(checkpoint, default=num_classes)
+    if head_classes != num_classes:
+        print(f'  note: checkpoint head is {head_classes}-way vs {num_classes} class-map entries '
+              f'({num_classes - head_classes:+d}); building the backbone {head_classes}-way. The '
+              f'head is unused -- prototypes follow the class-map. Classes added since training get '
+              f'a prototype from their images without retraining; verify the new class below.')
+    model = timm.create_model(MODEL_NAME, num_classes=head_classes, pretrained=False)
     load_checkpoint(model, checkpoint, weights_only=False)
     model.eval().to(device)
 
@@ -1185,16 +1214,16 @@ def main():
     feats = extract_train_features(model, transform, device, args.data_dir, args.img_size,
                                    class_map_names)
 
-    # The threshold is ALWAYS calibrated -- there is no way to pin one. A hand-set value goes stale
-    # silently the moment the checkpoint or the class set changes, and nothing in the artifact would
-    # show it. Calibration is seeded, so this stays reproducible.
+    # The threshold is ALWAYS calibrated -- there is no way to pin one, and no way to skip it. A
+    # hand-set value goes stale silently the moment the checkpoint or the class set changes, and
+    # nothing in the artifact would show it. Calibration is seeded, so this stays reproducible.
+    # (There used to be a --calibrate report-only flag; it only suppressed the export, which
+    # omitting --export-pt/--export-onnx already does, so the sweep prints either way.)
     calib = calibrate_threshold(
         model, transform, device, args.data_dir, args.img_size, class_map_names,
         aug=args.aug, aug_views=args.aug_views,
         aug_max_per_class=args.aug_max_per_class or 0, cpu_aug=args.cpu_aug, feats=feats,
         min_threshold=args.min_threshold)
-    if args.calibrate:                      # report-only mode: never exports
-        return
     threshold = calib['suggested']
     # Record how the threshold was reached, so the artifact carries its own evidence rather
     # than that living in someone's shell history.
