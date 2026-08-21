@@ -185,14 +185,14 @@ sh nptools/train_posm.sh \
   rebuilds the model and loads fp32 weights). Disable with `--no-amp`; if the ArcFace margin logits
   ever produce NaN losses, pass `--amp-dtype bfloat16` through.
 - **The split is pre-resized before training, always.** `nptools/resize_dataset.py` writes a sibling
-  `<data-dir>_<2N>` tree (squashed to `2N × 2N`, where N is `--resize`, default 224) and training
-  reads that. This is not a shortcut: `npaug` normalises every sample to a `2*img_size` canvas, so
+  `<data-dir>/train_<2N>` split (squashed to `2N × 2N`, where N is `--img-size`, default 224) and
+  passes `--train-split train_<2N>`, so the dataset root stays put. This is not a shortcut: `npaug` normalises every sample to a `2*img_size` canvas, so
   nothing above it survives — and decoding full-resolution sources each epoch cost **10.5 ms of the
   14.3 ms** per-sample budget, more than the entire augmentation. Measured: the 16-worker loader goes
   941.8 → 1820.0 img/s and the split shrinks 1705 MB → 879 MB, built in ~8 s.
   Originals are never modified, `imbaldup_*` symlinks from step 6 are relinked (not duplicated), and
   `nobg_*.png` cutouts keep PNG + alpha. Re-runs are mtime-checked, so only changed images are rewritten.
-- **`--resize N`** (default 224) is the single size knob: it is the model input size passed to
+- **`--img-size N`** (default 224) is the single size knob: it is passed straight to
   `train.py --img-size`, it fixes the pre-resize target at `2N`, and it fills in the sizes in the
   export commands printed at the end of the run. Keep it consistent across training and export.
 - **`--workers`** is derived as 2/3 of the **physical** cores, not `nproc`: this augmentation is
@@ -281,7 +281,7 @@ uv run pnnx <DATA>/output/<run>/openset.pt inputshape=[1,3,224,224]
 #     all written NEXT TO the .pt, so they land in the run dir beside the checkpoint)
 ```
 
-`train_posm.sh` prints this line too, with the path and `inputshape` already matching `--resize`.
+`train_posm.sh` prints this line too, with the path and `inputshape` already matching `--img-size`.
 
 - **`inputshape` must match the exported `--img-size`.** pnnx traces at that shape and
   constant-folds `Conv2dSame`'s dynamic padding against it, so a wrong value bakes wrong padding

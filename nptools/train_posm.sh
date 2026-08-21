@@ -18,7 +18,7 @@ CLASS_MAP=""
 # emitting the flag at all -- hence the wrapper owns it, via --no-arcface / --no-per-class-acc.
 ARCFACE=1
 PER_CLASS_ACC=1
-# THE size knob, set by --resize. It is the model input size (forwarded to train.py --img-size,
+# THE size knob, set by --img-size. It is the model input size (forwarded to train.py --img-size,
 # and to openset.py / pnnx in the export hint), and it also fixes the pre-resize target at 2x it:
 # npaug's build_aug_pipeline normalises every sample to a 2*img_size square before cropping back,
 # so 2*IMG_SIZE -- not IMG_SIZE -- is the most detail the pipeline can use and therefore the right
@@ -36,8 +36,9 @@ AMP=1
 # per-sample budget -- more than the whole augmentation -- and npaug's PIL draft() cannot help the
 # elongated shelf crops that dominate this dataset (JPEG DCT scaling is uniform, so it only reduces
 # when BOTH axes exceed the budget). Doing it once, offline, is axis-independent. It writes a
-# sibling <data-dir>_<2*IMG_SIZE> tree and trains from that; the originals are never touched, and
-# re-runs are idempotent (mtime-checked), so the cost after the first launch is a directory walk.
+# sibling <data-dir>/train_<2*IMG_SIZE> split and trains from that via --train-split; the originals
+# are never touched, and re-runs are idempotent (mtime-checked), so the cost after the first
+# launch is a directory walk.
 
  # Consume script-level flags here (not forwarded to train.py); anything else is
  # collected in EXTRA_ARGS and passed through. Must run BEFORE `set --` below
@@ -47,7 +48,7 @@ AMP=1
  #   --data-dir  PATH   dataset root        (default: $DATA_DIR)
  #   --output-dir PATH  output/checkpoints  (default: $DATA_DIR/output)
  #   --class-map PATH   class-map file      (default: $DATA_DIR/class_84.txt)
- #   --resize    N      model input size    (default: 224; split always pre-resized to 2*N)
+ #   --img-size  N      model input size    (default: 224; split always pre-resized to 2*N)
  #   --no-arcface       disable --arcface        (on by default)
  #   --no-per-class-acc disable --per-class-acc  (on by default)
  #   --no-amp           disable --amp            (on by default)
@@ -63,9 +64,9 @@ Options:
   --data-dir  PATH   Dataset root.        (default: $DATA_DIR)
   --output-dir PATH  Output/checkpoints.  (default: \$DATA_DIR/output)
   --class-map PATH   Class-map file.      (default: \$DATA_DIR/class_84.txt)
-  --resize N         Model input size. (default: ${IMG_SIZE}) Passed to train.py as --img-size,
+  --img-size N       Model input size. (default: ${IMG_SIZE}) Passed straight to train.py,
                      and used in the export commands printed at the end. The split is ALWAYS
-                     pre-resized once into <data-dir>_<2N> and trained from there, because npaug
+                     pre-resized once into <data-dir>/train_<2N> and trained from there, because npaug
                      normalises every sample to a 2*img_size canvas -- 2N is exactly the detail
                      the pipeline can use. Originals are never modified.
   --test-npaug-dir PATH  DRY-RUN: no training; dump augmented images (grouped by class)
@@ -109,8 +110,8 @@ EOF
          --class-map=*)  CLASS_MAP="${1#*=}" ;;
          # Consumed, not forwarded verbatim: the wrapper re-emits it as train.py --img-size AND
          # derives the pre-resize target (2x) and the export hint's sizes from it.
-         --resize)       IMG_SIZE="$2"; shift ;;
-         --resize=*)     IMG_SIZE="${1#*=}" ;;
+         --img-size)     IMG_SIZE="$2"; shift ;;
+         --img-size=*)   IMG_SIZE="${1#*=}" ;;
          --test-npaug-dir)     TEST_NPAUG_DIR="$2"; shift ;;
          --test-npaug-dir=*)   TEST_NPAUG_DIR="${1#*=}" ;;
          --test-npaug-class)   TEST_NPAUG_CLASS="$2"; shift ;;
@@ -137,11 +138,11 @@ EOF
 NUM_CLASSES=$(grep -cve '^[[:space:]]*$' "${CLASS_MAP}")
 
  # IMG_SIZE feeds shell arithmetic (2*IMG_SIZE) and a directory name, so reject junk here rather
- # than letting $(( )) treat it as 0 and silently build a <data-dir>_0 tree.
+ # than letting $(( )) treat it as 0 and silently build a train_0 split.
 case "$IMG_SIZE" in
-    ''|*[!0-9]*) echo "--resize must be a positive integer, got '${IMG_SIZE}'" >&2; exit 2 ;;
+    ''|*[!0-9]*) echo "--img-size must be a positive integer, got '${IMG_SIZE}'" >&2; exit 2 ;;
 esac
-[ "$IMG_SIZE" -gt 0 ] || { echo "--resize must be > 0" >&2; exit 2; }
+[ "$IMG_SIZE" -gt 0 ] || { echo "--img-size must be > 0" >&2; exit 2; }
 
  # Scale DataLoader workers with the box instead of hardcoding: this run is data-bound, not
  # GPU-bound -- npaug.py's per-sample albumentations costs ~25ms of pure CPU, so throughput is
@@ -167,21 +168,56 @@ ARCFACE_FLAGS=""
 AMP_FLAGS=""
 [ "$AMP" = "1" ]           && AMP_FLAGS="--amp --channels-last"
 
- # ── Pre-resize the training split (see RESIZE above) ────────────────────────────────────────────
- # Deliberately AFTER the OUTPUT_DIR / CLASS_MAP / NUM_CLASSES derivations above: those must stay
- # anchored to the ORIGINAL data dir, so checkpoints and --resume keep living next to the source
- # dataset instead of migrating into the resized copy on the first run that enables this.
- # Only DATA_DIR (what train.py reads images from) is redirected. Idempotent -- a second launch
- # re-checks mtimes and rewrites nothing, so this costs a directory walk once the tree exists.
-ORIG_DATA_DIR="${DATA_DIR}"
+ # ── Pre-resize the training split (see IMG_SIZE above) ──────────────────────────────────────────
+ # --data-dir is the DATASET ROOT and must contain a train/ subfolder. Requiring it explicitly
+ # matters because timm does not: create_dataset() calls _search_split(), which silently falls back
+ # to the root when the named split is absent, so a wrong --data-dir trains on whatever happens to
+ # be underneath it instead of failing.
+DATA_DIR="${DATA_DIR%/}"
+TRAIN_SPLIT="train"
+if [ ! -d "${DATA_DIR}/${TRAIN_SPLIT}" ]; then
+    echo "error: no '${TRAIN_SPLIT}' subfolder under --data-dir '${DATA_DIR}'." >&2
+    echo "       --data-dir is the dataset ROOT; class folders belong in" >&2
+    echo "       '${DATA_DIR}/${TRAIN_SPLIT}/<class>/'." >&2
+    exit 2
+fi
+
+ # Pick the validation split by looking for it, and say which one won. train.py's default is
+ # "validation", and timm resolves a MISSING split by falling back to the dataset root -- which now
+ # holds train/ AND the resized train_<2N>/, so a missing val split would quietly validate on every
+ # training image twice plus anything else under the root (outlier/, inlier/, ...). Resolving it
+ # here makes the choice explicit and keeps that fallback from ever triggering.
+VAL_SPLIT=""
+for cand in val validation; do
+    if [ -d "${DATA_DIR}/${cand}" ]; then
+        VAL_SPLIT="${cand}"
+        break
+    fi
+done
+
+ # Resize train/ into a SIBLING SPLIT inside the same root, and point --train-split at it, so the
+ # dataset root (and therefore --output, --class-map and any --val-split) stays put. Idempotent:
+ # a second launch re-checks mtimes and rewrites nothing, so this costs a directory walk.
 RESIZE_SIZE=$((2 * IMG_SIZE))            # npaug's canvas; see IMG_SIZE above
-RESIZED_DIR="${DATA_DIR%/}_${RESIZE_SIZE}"
+RESIZED_SPLIT="${TRAIN_SPLIT}_${RESIZE_SIZE}"
 if uv run python -m nptools.resize_dataset \
-        --src "${DATA_DIR%/}" --out "${RESIZED_DIR}" --size "${RESIZE_SIZE}"; then
-    DATA_DIR="${RESIZED_DIR}"
-    echo "training from the resized split: ${DATA_DIR}"
+        --src "${DATA_DIR}/${TRAIN_SPLIT}" --out "${DATA_DIR}/${RESIZED_SPLIT}" \
+        --size "${RESIZE_SIZE}"; then
+    TRAIN_SPLIT="${RESIZED_SPLIT}"
+    echo "training from the resized split: ${DATA_DIR}/${TRAIN_SPLIT}"
 else
-    echo "resize_dataset failed -- falling back to the original images at ${DATA_DIR}"
+    echo "resize_dataset failed -- training from the originals at ${DATA_DIR}/${TRAIN_SPLIT}"
+fi
+
+ # Resolved after the resize, so the no-held-out-data fallback reuses the split actually trained on
+ # rather than the originals -- eval then at least shares the training preprocessing.
+if [ -n "${VAL_SPLIT}" ]; then
+    echo "validating on: ${DATA_DIR}/${VAL_SPLIT}"
+else
+    VAL_SPLIT="${TRAIN_SPLIT}"
+    echo "note: no val/ or validation/ under ${DATA_DIR} -- validating on the TRAINING split" \
+         "(${VAL_SPLIT}). eval_top1 then measures fit, not generalization, and model_best is" \
+         "selected on it. Add ${DATA_DIR}/val/<class>/ for a real held-out metric."
 fi
 
  if [ "${DEBUGPY:-0}" = "1" ]; then
@@ -229,6 +265,8 @@ fi
      --checkpoint-hist=10 \
      --epochs=60 \
      --data-dir="${DATA_DIR}" \
+     --train-split="${TRAIN_SPLIT}" \
+     --val-split="${VAL_SPLIT}" \
      --class-map="${CLASS_MAP}" \
      --output="${OUTPUT_DIR}" \
      --num-classes="${NUM_CLASSES}" \
@@ -246,16 +284,10 @@ TRAIN_STATUS=$?
  # The follow-up step needs three paths that only this script knows (the timestamped run dir, the
  # class-map, and openset.py's data-dir), so reconstructing it by hand is where mistakes happen.
  #
- # openset.py wants the directory that CONTAINS train/, which is NOT necessarily train.py's
- # --data-dir: this wrapper is usually pointed straight at the class-folder root (timm falls back to
- # the root when <data-dir>/train is absent), in which case openset.py wants its PARENT.
- # ORIG_DATA_DIR, not DATA_DIR: prototypes and the calibrated threshold must come from the images a
- # deployed client will actually see, i.e. the originals -- not from a copy pre-shrunk for training.
-if [ -d "${ORIG_DATA_DIR}/train" ]; then
-    OPENSET_DATA_DIR="${ORIG_DATA_DIR}"
-else
-    OPENSET_DATA_DIR=$(dirname "${ORIG_DATA_DIR}")
-fi
+ # openset.py takes the same dataset root and reads <root>/train itself, i.e. the ORIGINAL images --
+ # never the pre-shrunk training split. That is deliberate: prototypes and the calibrated threshold
+ # have to come from the images a deployed client will actually see.
+OPENSET_DATA_DIR="${DATA_DIR}"
 BEST=$(ls -td "${OUTPUT_DIR}"/20*/model_best.pth.tar 2>/dev/null | head -1)
 
 if [ "$TRAIN_STATUS" != "0" ]; then
@@ -278,7 +310,7 @@ cat <<EOF
 Next step -- export the open-set model (prototypes + calibrated threshold baked in).
 TorchScript (for pnnx -> ncnn) and ONNX in one run:
 
-  uv run --no-sync python nptools/openset.py \\
+  uv run python nptools/openset.py \\
       --data-dir ${OPENSET_DATA_DIR} \\
       --class-map ${CLASS_MAP} \\
       --checkpoint ${BEST} \\
@@ -293,7 +325,7 @@ Drop either --export-* to emit only that format. Each artifact gets a .meta.json
 Then convert the TorchScript file to ncnn (writes openset.ncnn.param/.bin next to the .pt,
 alongside .pnnx.* intermediates you can delete):
 
-  uv run --no-sync pnnx $(dirname "${BEST}")/openset.pt inputshape=[1,3,${IMG_SIZE},${IMG_SIZE}]
+  uv run pnnx $(dirname "${BEST}")/openset.pt inputshape=[1,3,${IMG_SIZE},${IMG_SIZE}]
 
 inputshape must match --img-size above: pnnx traces at that shape and constant-folds the
 SAME-padding arithmetic against it, so a wrong value bakes wrong padding into the .param.
