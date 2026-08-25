@@ -193,6 +193,43 @@ throughout.
 - Caveats: `PriorBox` is Caffe-style and cannot produce FORMAT4 anchors (bake them); every change in
   N costs a `resizeSession` reallocation, so pin K.
 
+### Preferred variant — fuse only the ROI crop into stage 2
+
+Rather than fusing both stages, give the **open-set model a second input** and leave the detector
+alone: `forward(photo [1,3,800,600], rois [N,5]) -> dists [N,83], margins [N,83]`.
+
+```python
+def forward(self, photo, rois):              # rois = (batch_idx, x1, y1, x2, y2)
+    crops = roi_align(photo, rois, output_size=(128, 128),
+                      spatial_scale=1.0, sampling_ratio=k, aligned=True)   # [N,3,128,128]
+    crops = crops * self.scale + self.bias   # recover the classifier normalization
+    feat = F.normalize(self.backbone...(crops), dim=1)                     # [N,1280]
+    dists = 1.0 - feat @ self.proto_mat.t()                                # [N,83]
+    return dists, dists - self.thresh
+```
+
+Why this beats fusing everything:
+
+- **NMS stays on the client**, so no data-dependent shape ever enters a graph. N arrives as an input
+  dimension, which every runtime handles far better than an NMS output.
+- The detector stays independent and separately retrainable; only the model that already gets
+  re-exported on every training run changes.
+- Everything downstream of `crops` is already batch-clean on the `no_argmin=True` path — no edits.
+- ROI coordinates get simpler: `spatial_scale=1.0` puts them in the photo tensor's own pixel space,
+  and that tensor *is* the 600×800 one the detector consumed, so it is just `x·600, y·800` off the
+  detector's normalized output. Original photo dimensions drop out entirely.
+- Combined with the commuting trick below, **one image buffer serves both stages**.
+
+Use the `[N,5]` box form rather than `List[Tensor[N,4]]` — it scripts more cleanly.
+
+Cost: still cannot run on ncnn (single-ROI `ROIAlign`, no batch dim), so it means migrating stage 2
+to MNN/ORT/LibTorch and replacing the pnnx step in `export_ncnn.sh` with ONNX → `MNNConvert`. The
+detector can stay on ncnn. Whether that price is worth paying is exactly what the Android bench in
+§6 is meant to answer — if stage 2 does not dominate on device, none of this is needed.
+
+The §5 caveats carry over unchanged: `sampling_ratio` vs `INTER_AREA`, re-scoring the 28° threshold
+against the new resize, and the box-size-vs-133×256 question.
+
 ### A trick if you ever do fuse
 
 ROIAlign is a weighted average with weights summing to 1, so a per-channel offset **commutes** with
@@ -242,7 +279,8 @@ inheriting the threshold. Footnote: `cv2.INTER_AREA` degenerates to nearest-neig
 
 ## 6. Where this got to, and what is next
 
-**Current lean: keep the two stages split, crop box-by-box, classify one at a time.** It is the exact
+**Current lean: keep the two stages split, crop box-by-box, classify one at a time** (see §4 for the
+ROI-input variant of stage 2, which is the preferred move if the device bench says stage 2 dominates). It is the exact
 path the prototypes and threshold were calibrated on (cv2 crop + INTER_AREA squash), it keeps the
 stages decoupled — which matters because `export_ncnn.sh` rebuilds prototypes and recalibrates the
 threshold on every training run — and it runs on ncnn today with `predict_ncnn.py` / `.cpp` already
