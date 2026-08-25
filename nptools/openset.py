@@ -473,6 +473,9 @@ def build_prototypes(model, transform, device: str, data_dir: str, img_size: int
 
     If `copy_inliers` is set, the good inlier crops (cosine dist <= OUTLIER_THR to their class
     prototype) are copied into `<data_dir>/inlier/<class>/` for training a clean classifier.
+
+    Returns (prototypes, class_names, outlier_paths); the third is the set of source paths that
+    were excluded, so a caller can score with and without them (see evaluate_two_rounds).
     """
     if threshold < min_threshold:
         raise ValueError(f'threshold {threshold} is below the {min_threshold} floor; see '
@@ -491,6 +494,7 @@ def build_prototypes(model, transform, device: str, data_dir: str, img_size: int
     inlier_root = Path(data_dir) / 'inlier'   # clean (dist<=thr) images, for training a clean classifier
     n_inliers_copied = 0
     outlier_rows = []   # CSV rows: (classtype/file, bad_dist, nearest_type, nearest_dist)
+    outlier_paths = set()   # source paths of excluded crops, for the inliers-only eval round
     inlier_rows = []    # CSV rows: (classtype/file, distance) — only when copy_inliers
 
     # Pre-pass: an initial (pre-exclusion) mean prototype per class, used only to tell WHICH other
@@ -530,6 +534,7 @@ def build_prototypes(model, transform, device: str, data_dir: str, img_size: int
                                 if near_cls is not None else 'nearest_other=n/a')
                     print(f'               dist={dists0[j]:.4f}  {near_str}  '
                           f'{_short_path(paths[j], data_dir)}')
+                    outlier_paths.add(str(src))
                     outlier_rows.append((
                         f'{cls}/{src.name}', f'{float(dists0[j]):.4f}',
                         near_cls if near_cls is not None else '',
@@ -596,7 +601,88 @@ def build_prototypes(model, transform, device: str, data_dir: str, img_size: int
     print(f'build_prototypes: {len(class_names)} classes '
           f'({len(class_names) - len(missing)} with data + {len(missing)} placeholder), '
           f'{len(samples)} images, constant threshold={threshold:.4f}, in {time.time() - t_start:.1f}s')
-    return prototypes, class_names
+    return prototypes, class_names, outlier_paths
+
+
+@torch.no_grad()
+def evaluate_two_rounds(feats: dict, prototypes: dict, class_names, threshold: float,
+                        outlier_paths: set, csv_path: str) -> list:
+    """Per-class recall/precision over the training crops, scored twice, written to `csv_path`.
+
+    Round "all" scores every crop; round "inliers" drops the ones build_prototypes excluded as
+    outliers. Only the SCORED SET differs -- same prototypes, same threshold -- so the delta between
+    the rounds is attributable to those crops alone, which is the point: it says how much each
+    class's numbers are being dragged down by crops the pipeline already believes are mislabelled.
+
+    Scored on the training split because that is where outlier membership is defined at all; these
+    are therefore fit numbers, not generalization. A class whose recall is poor even on the data it
+    was fitted to has a real problem (look-alike neighbour, or bad labels beyond the flagged ones).
+
+    Open-set means a crop can be rejected as `unknown`, which costs its true class recall while
+    inflating no other class's precision:
+        recall(c)    = predicted c AND truly c  /  truly c
+        precision(c) = predicted c AND truly c  /  predicted c      (blank when nothing predicted c)
+
+    Reuses the cached features from the clean pass, so both rounds are one matmul -- no re-decoding.
+    """
+    t_start = time.time()
+    proto_mat = torch.stack([prototypes[c] for c in class_names])          # [C, D]
+    dev = proto_mat.device
+    # `class_names` spans the whole class-map (placeholders included), while the cached features are
+    # indexed by the classes that actually had images -- so map between them by NAME, never by
+    # position. Getting this wrong silently scores every class against the wrong prototype.
+    col_of = {c: i for i, c in enumerate(class_names)}
+    feat_names = feats['class_names']
+    rows, summary = [], []
+    for tag in ('all', 'inliers'):
+        # counters per prototype column
+        n_true = [0] * len(class_names)
+        n_pred = [0] * len(class_names)
+        n_hit = [0] * len(class_names)
+        n_scored = n_unknown = 0
+        for fi, cls in enumerate(feat_names):
+            col = col_of.get(cls)
+            cls_feats = feats['feats_by_class'][fi]
+            cls_paths = feats['paths_by_class'][fi]
+            if col is None or not cls_feats:
+                continue
+            keep = [j for j, p in enumerate(cls_paths)
+                    if tag == 'all' or str(p) not in outlier_paths]
+            if not keep:
+                continue
+            f = torch.stack([cls_feats[j] for j in keep]).to(dev)          # [N, D]
+            dists = 1.0 - f @ proto_mat.t()                                # [N, C]
+            best = dists.argmin(dim=1)
+            rejected = dists.gather(1, best[:, None]).squeeze(1) > threshold
+            n_true[col] += len(keep)
+            n_scored += len(keep)
+            n_unknown += int(rejected.sum())
+            for b, rej in zip(best.tolist(), rejected.tolist()):
+                if rej:
+                    continue            # 'unknown': no class is credited with the prediction
+                n_pred[b] += 1
+                if b == col:
+                    n_hit[b] += 1
+        for i, cls in enumerate(class_names):
+            if not n_true[i] and not n_pred[i]:
+                continue                # placeholder / data-less class, nothing to report
+            recall = f'{n_hit[i] / n_true[i]:.4f}' if n_true[i] else ''
+            precision = f'{n_hit[i] / n_pred[i]:.4f}' if n_pred[i] else ''
+            rows.append((cls, recall, precision, tag))
+        total_hit = sum(n_hit)
+        summary.append((tag, n_scored, total_hit, n_unknown))
+
+    _write_aligned_csv(csv_path, ('class type', 'recall rate', 'precision rate', 'eval type'), rows)
+    print(f'\ntwo-round evaluation ({time.time() - t_start:.1f}s):')
+    for tag, n_scored, total_hit, n_unknown in summary:
+        acc = f'{total_hit / n_scored * 100:.2f}%' if n_scored else 'n/a'
+        print(f'  {tag:8s}: {n_scored:6d} crops, {total_hit:6d} correct ({acc}), '
+              f'{n_unknown} rejected as unknown')
+    if len(summary) == 2 and summary[0][1] and summary[1][1]:
+        d = summary[1][2] / summary[1][1] - summary[0][2] / summary[0][1]
+        print(f'  dropping {len(outlier_paths)} outlier crop(s) moves accuracy by {d * 100:+.2f}pp')
+    print(f'  per-class recall/precision -> {csv_path}')
+    return rows
 
 
 def _loo_positive_dists(feats: torch.Tensor) -> torch.Tensor:
@@ -1118,6 +1204,13 @@ def main():
                         help='max images per class for the aug probe pass (default: 200); 0 = use all')
     parser.add_argument('--cpu-aug', action='store_true', default=False,
                         help='use CPU npaug (albumentations) instead of GPU torchvision for the aug probe')
+    parser.add_argument(
+        '--eval-csv', nargs='?', const='', default=None, metavar='PATH',
+        help='score the training crops per class TWICE -- once over everything, once with the '
+             'outlier crops dropped -- and write (class type, recall rate, precision rate, eval '
+             'type) to PATH (default <checkpoint dir>/eval_rounds.csv). Same prototypes and '
+             'threshold both rounds, so the delta isolates what the flagged crops cost.',
+    )
     parser.add_argument('--copy-inliers', action='store_true', default=False,
                         help='copy the good inlier crops (cosine dist<=0.5 to their class prototype) into '
                              '<data-dir>/inlier/<class>/ for training a clean classifier')
@@ -1238,11 +1331,15 @@ def main():
           f'FAR={meta_extra["threshold_far"] * 100:.2f}%)')
 
     print('Building class prototypes from training set...')
-    prototypes, class_names = build_prototypes(
+    prototypes, class_names, outlier_paths = build_prototypes(
         model, transform, device, args.data_dir, args.img_size, class_map_names,
         threshold=threshold, copy_inliers=args.copy_inliers, feats=feats,
         min_threshold=args.min_threshold)
     print(f'\nConstant threshold {threshold:.4f} applied to {len(class_names)} classes\n')
+
+    if args.eval_csv is not None:
+        eval_csv = args.eval_csv or os.path.join(os.path.dirname(checkpoint) or '.', 'eval_rounds.csv')
+        evaluate_two_rounds(feats, prototypes, class_names, threshold, outlier_paths, eval_csv)
 
     # Placeholder classes are exported like any other (index alignment is the point), so name them
     # in the sidecar -- otherwise a client has no way to tell "this class has no training data" from

@@ -19,10 +19,10 @@ own docs for depth:
       │
       ▼
  train_posm.sh   (ArcFace; --nobg bg-swap)   ─►  checkpoint   ◄─ needs: class map, bg photos (NOBG_BG_DIR)
-      │
+      │        └─ writes <run>/export_ncnn.sh and runs it (--no-ncnn to skip), i.e. the two steps below
       ▼
  openset.py   (prototypes + calibrated threshold)   ─►  .pt / .onnx (+ meta.json)   ◄─ needs: class map
-      │
+      │                                              ─►  eval_rounds.csv  (per-class recall/precision)
       ▼
  pnnx   ─►  .ncnn.param / .ncnn.bin
 ```
@@ -200,10 +200,22 @@ sh nptools/train_posm.sh \
   than 16 (418 vs 576 img/s). Override with `WORKERS=N` in the environment.
 - `--new` starts from the pretrained backbone; without it the script resumes the latest
   `last.pth.tar` under the output dir.
+- **Resuming continues in the same run folder**, rather than scattering a new timestamped directory
+  per launch, so `summary.csv`, the checkpoint history and the export artifacts stay together. The
+  wrapper compares a signature of the training-relevant settings (model, `--img-size`, splits,
+  class-map, num-classes, arcface, amp; *not* `--workers`, which changes nothing about the model)
+  against `train_sig.txt` in that folder, falling back to the folder's `args.yaml` for runs made
+  before signatures existed. If the settings **differ**, this is a different experiment that merely
+  starts from those weights, so it gets its own folder and the wrapper prints the diff. A launch
+  that dies before saving a checkpoint has its (empty) folder removed again.
+- **`--data-dir` must contain a `train/` subfolder**, and a missing one is a hard error. timm would
+  otherwise fall back to the dataset root without warning and train on whatever is underneath it.
+  The validation split is resolved the same way: `val/`, else `validation/`, else — with a warning
+  that says what it costs — the training split itself.
 - Checkpoints land in `<DATA>/output/<timestamp>/`; use `model_best.pth.tar` next. **When training
-  finishes the script prints the exact `openset.py` export command and the `pnnx` follow-up**, with
-  the run directory, class-map, `--data-dir` and sizes already filled in — steps 8 and 9 below
-  explain what those commands do, but you can copy them straight from the run output.
+  finishes the wrapper writes `<run>/export_ncnn.sh` and runs it**, producing the exported model,
+  the ncnn files and the per-class evaluation CSV — steps 8 and 9 explain what it does. Pass
+  `--no-ncnn` to write the script without running it.
 
 ---
 
@@ -228,12 +240,16 @@ uv run python nptools/openset.py \
     --ck <DATA>/output/<run>/model_best.pth.tar \
     --img-size 224 \
     --no-argmin \
+    --eval-csv <DATA>/output/<run>/eval_rounds.csv \
     --export-pt <DATA>/output/<run>/openset.pt \
     --export-onnx <DATA>/output/<run>/openset.onnx
 ```
 
-`train_posm.sh` prints this command with every path filled in when training ends, so prefer copying
-it from there over retyping it.
+**You normally do not run this by hand.** When training finishes, `train_posm.sh` writes
+`<DATA>/output/<run>/export_ncnn.sh` with every path and size already filled in, and — unless you
+passed `--no-ncnn` — runs it, producing the exported model, the ncnn files (step 9) and the
+evaluation CSV (below) in one go. The script stays in the run dir, so re-running or editing it later
+reproduces exactly what shipped.
 
 Two things that are easy to get wrong and do **not** fail loudly:
 - **`--data-dir` here is not `train.py`'s.** `openset.py` wants the directory that *contains*
@@ -263,6 +279,20 @@ What happens:
 - Export writes `openset.pt` (or `.onnx`) **plus** `openset.pt.meta.json` (class order, the scalar
   threshold, img_size, mean/std, resize filter, and the measured FRR/FAR that justified the
   value). After export it **self-verifies** by predicting through the exported model.
+- **`--eval-csv` scores the training crops per class, twice**, and writes
+  `(class type, recall rate, precision rate, eval type)`:
+  - `all` — every crop;
+  - `inliers` — the same crops minus the ones excluded as outliers when the prototypes were built.
+
+  Same prototypes and same threshold in both rounds, so the delta is exactly what those crops cost,
+  per class. It reuses the feature pass the export already ran, so it is effectively free (0.2s).
+
+  Read it for **data hygiene, not accuracy**: the scored crops are the ones that built the
+  prototypes, so recall sits near 100% by construction, and the useful signal is *which* classes
+  move between the two rounds — those are the ones carrying mislabelled crops (cross-check them in
+  `outlier/outlier.txt`, §2.1 of [`openset.md`](openset.md)). Note also that `OUTLIER_THR` is a
+  hardcoded 0.5: when the calibrated threshold lands near it, "outlier" and "would be rejected"
+  nearly coincide and the `inliers` round is close to tautological.
 
 Why one threshold rather than per-class, how calibration works, the client's preprocessing contract,
 and ncnn conversion are all in [`openset.md`](openset.md).
@@ -271,8 +301,9 @@ and ncnn conversion are all in [`openset.md`](openset.md).
 
 ## 9. Convert to ncnn with pnnx
 
-Turn the exported `.pt` (or `.onnx`) into ncnn files for on-device deployment. Install the tools
-once, then run pnnx with the model's input shape:
+**Also normally automatic**: the `export_ncnn.sh` from step 8 runs this itself (and installs pnnx on
+demand). Do it by hand only when converting an older `.pt`, or after editing the graph. Install the
+tools once, then run pnnx with the model's input shape:
 
 ```bash
 uv pip install pnnx ncnn                                   # once (not a project dependency)
@@ -281,7 +312,7 @@ uv run pnnx <DATA>/output/<run>/openset.pt inputshape=[1,3,224,224]
 #     all written NEXT TO the .pt, so they land in the run dir beside the checkpoint)
 ```
 
-`train_posm.sh` prints this line too, with the path and `inputshape` already matching `--img-size`.
+`train_posm.sh`'s generated script already pins the path and an `inputshape` matching `--img-size`.
 
 - **`inputshape` must match the exported `--img-size`.** pnnx traces at that shape and
   constant-folds `Conv2dSame`'s dynamic padding against it, so a wrong value bakes wrong padding
@@ -364,7 +395,8 @@ sh nptools/train_posm.sh --data-dir <DATA> --class-map <DATA>/class_84.txt --new
 # 8. build + export open-set model (threshold is calibrated automatically)
 uv run python nptools/openset.py --data-dir <DATA> --class-map <DATA>/class_84.txt \
     --ck <DATA>/output/<run>/model_best.pth.tar --img-size 224 --no-argmin \
+    --eval-csv <DATA>/output/<run>/eval_rounds.csv \
     --export-pt <DATA>/output/<run>/openset.pt --export-onnx <DATA>/output/<run>/openset.onnx
 # 9. convert to ncnn (outputs land next to the .pt)
-uv run pnnx <DATA>/output/<run>/openset.pt inputshape=[1,3,224,224]   # → openset.ncnn.param + .bin
+uv run pnnx <DATA>/output/<run>/openset.pt inputshape=[1,3,128,128]   # → openset.ncnn.param + .bin
 ```
