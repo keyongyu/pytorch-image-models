@@ -4,6 +4,10 @@
 #   cmake --build build -j
 #   ./build/predict_ncnn <run>/openset.ncnn.param <run>/openset.ncnn.bin \
 #                        ../../posmlvx/class_84.txt photo.jpg 128
+#   ./build/bench_ncnn   <run>/openset.ncnn.param <run>/openset.ncnn.bin \
+#                        ../../posmlvx/train_256/posm_33 128 1 5 area   # dir size threads reps resize
+#   ./build/opts_ncnn    <run>/openset.ncnn.param <run>/openset.ncnn.bin \
+#                        ../../posmlvx/train_256/posm_33                # flag sweep
 #
 # ncnn is fetched and built as a subproject, pinned to NCNN_TAG below, so no ncnn install is
 # needed: it is not packaged for Ubuntu, and the pip `ncnn` wheel ships only the Python extension
@@ -63,12 +67,19 @@ find_package(OpenCV 4 REQUIRED COMPONENTS imgcodecs imgproc)
 # link step with undefined omp_* symbols. Optional: single-threaded still runs correctly.
 find_package(OpenMP)
 
-add_executable(predict_ncnn predict_ncnn.cpp)
-target_link_libraries(predict_ncnn PRIVATE ncnn ${OpenCV_LIBS})
-target_include_directories(predict_ncnn PRIVATE ${OpenCV_INCLUDE_DIRS})
-if(OpenMP_CXX_FOUND)
-    target_link_libraries(predict_ncnn PRIVATE OpenMP::OpenMP_CXX)
-else()
+# predict_ncnn: the reference client. bench_ncnn: throughput, split into resize / Mat+normalize /
+# forward, because which of the three dominates decides where optimising is worth anything.
+# opts_ncnn: sweeps ncnn's optimisation flags for speed AND numerical drift -- meant to be run on
+# the deployment device, since the fp16 flags are ARM-only and inert on x86.
+foreach(tgt predict_ncnn bench_ncnn opts_ncnn)
+    add_executable(${tgt} ${tgt}.cpp)
+    target_link_libraries(${tgt} PRIVATE ncnn ${OpenCV_LIBS})
+    target_include_directories(${tgt} PRIVATE ${OpenCV_INCLUDE_DIRS})
+    if(OpenMP_CXX_FOUND)
+        target_link_libraries(${tgt} PRIVATE OpenMP::OpenMP_CXX)
+    endif()
+endforeach()
+if(NOT OpenMP_CXX_FOUND)
     message(WARNING "OpenMP not found -- ncnn will run single-threaded")
 endif()
 

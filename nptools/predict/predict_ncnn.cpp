@@ -15,7 +15,9 @@
 //
 // Run:
 //   ./predict_ncnn <run>/openset.ncnn.param <run>/openset.ncnn.bin \
-//                  posmlvx/class_84.txt photo.jpg [img_size]
+//                  posmlvx/class_84.txt photo.jpg [img_size] [resize]
+//
+// [resize] is "area" (default) or "ncnn" -- see the note at the resize call for the trade-off.
 //
 // PREPROCESSING CONTRACT — every line of it matters, and none of it fails loudly if wrong:
 //
@@ -73,14 +75,27 @@ struct Prediction {
     bool unknown = true;
 };
 
-Prediction predict(ncnn::Net& net, const cv::Mat& bgr, int img_size)
+Prediction predict(ncnn::Net& net, const cv::Mat& bgr, int img_size, bool use_ncnn_resize)
 {
-    cv::Mat resized;
-    // squash to a square, INTER_AREA — see the contract above
-    cv::resize(bgr, resized, cv::Size(img_size, img_size), 0, 0, cv::INTER_AREA);
-
-    ncnn::Mat in = ncnn::Mat::from_pixels(resized.data, ncnn::Mat::PIXEL_BGR,
-                                          resized.cols, resized.rows);
+    // Two ways to squash the crop to a square. Both use the STRIDE overload, so a crop that is a
+    // view into a larger image (what a detector hands over) is read correctly rather than sheared.
+    //
+    //   area: cv::resize INTER_AREA then from_pixels -- the EXACT path, the filter the prototypes
+    //         were built with. INTER_AREA averages every source pixel.
+    //   ncnn: from_pixels_resize folds the scale into the Mat build, ~22x cheaper for that step,
+    //         but BILINEAR -- on a large downscale it samples a fixed 2x2 neighbourhood and
+    //         aliases, so the distances shift. Measure before trusting it on borderline crops.
+    ncnn::Mat in;
+    if (use_ncnn_resize) {
+        in = ncnn::Mat::from_pixels_resize(bgr.data, ncnn::Mat::PIXEL_BGR,
+                                           bgr.cols, bgr.rows, static_cast<int>(bgr.step),
+                                           img_size, img_size);
+    } else {
+        cv::Mat resized;
+        cv::resize(bgr, resized, cv::Size(img_size, img_size), 0, 0, cv::INTER_AREA);
+        in = ncnn::Mat::from_pixels(resized.data, ncnn::Mat::PIXEL_BGR,
+                                    resized.cols, resized.rows, static_cast<int>(resized.step));
+    }
     // (x/255 - 0.5) / 0.5  ==  (x - 127.5) * (1/127.5)
     const float mean_vals[3] = {127.5f, 127.5f, 127.5f};
     const float norm_vals[3] = {1.f / 127.5f, 1.f / 127.5f, 1.f / 127.5f};
@@ -114,7 +129,8 @@ int main(int argc, char** argv)
 {
     if (argc < 5) {
         fprintf(stderr,
-                "usage: %s openset.ncnn.param openset.ncnn.bin class_map.txt image [img_size]\n",
+                "usage: %s openset.ncnn.param openset.ncnn.bin class_map.txt image "
+                "[img_size] [area|ncnn]\n",
                 argv[0]);
         return 1;
     }
@@ -125,6 +141,11 @@ int main(int argc, char** argv)
     // Not discoverable from the .param (pnnx emits Input without dims), so it is passed in. It must
     // match the img_size in the sidecar .meta.json — a mismatch does not error, it just degrades.
     const int img_size = (argc > 5) ? atoi(argv[5]) : 128;
+    const std::string resize_mode = (argc > 6) ? argv[6] : "area";
+    if (resize_mode != "area" && resize_mode != "ncnn") {
+        fprintf(stderr, "[resize] must be \"area\" or \"ncnn\", got \"%s\"\n", resize_mode.c_str());
+        return 1;
+    }
 
     std::vector<std::string> names = read_class_names(class_map);
     if (names.empty()) return 1;
@@ -149,7 +170,7 @@ int main(int argc, char** argv)
         return 1;
     }
 
-    Prediction p = predict(net, bgr, img_size);
+    Prediction p = predict(net, bgr, img_size, resize_mode == "ncnn");
     if (p.best < 0) return 1;
 
     // Guard against a class-map that does not match the model: the exported column count is the
@@ -162,7 +183,7 @@ int main(int argc, char** argv)
         return 1;
     }
 
-    printf("%s\n", image_path);
+    printf("%s   [%dx%d, resize=%s]\n", image_path, img_size, img_size, resize_mode.c_str());
     printf("  detected: %s   dist=%.4f  margin=%+.4f\n",
            p.unknown ? "unknown" : names[p.best].c_str(), p.dist, p.margin);
     if (p.unknown)
