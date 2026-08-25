@@ -21,7 +21,7 @@ own docs for depth:
  train_posm.sh   (ArcFace; --nobg bg-swap)   ─►  checkpoint   ◄─ needs: class map, bg photos (NOBG_BG_DIR)
       │        └─ writes <run>/export_ncnn.sh and runs it (--no-ncnn to skip), i.e. the two steps below
       ▼
- openset.py   (prototypes + calibrated threshold)   ─►  .pt / .onnx (+ meta.json)   ◄─ needs: class map
+ openset.py   (prototypes + fixed-angle threshold)  ─►  .pt / .onnx (+ meta.json)   ◄─ needs: class map
       │                                              ─►  eval_rounds.csv  (per-class recall/precision)
       ▼
  pnnx   ─►  .ncnn.param / .ncnn.bin
@@ -80,9 +80,8 @@ Repeat step 2 for every product/class. Tuning (`--margin`, QC thresholds, etc.) 
   to send unknowns (the classic background-class approach to open-set with softmax). There it earns
   its keep.
 - **ArcFace open-set (this pipeline):** **no longer recommended.** Reject is decided by a single
-  **cosine-distance threshold** measured against leave-one-class-out negatives drawn from your own
-  labelled data (step 8), so unknowns are handled by distance-to-prototype — an `others` bucket is
-  not needed for the decision, and calibration does not need one either. You must not train it as a
+  **cosine-distance threshold** (a fixed angle, step 8), so unknowns are handled by
+  distance-to-prototype — an `others` bucket is not needed for the decision. You must not train it as a
   class anyway: `others` is heterogeneous and fights ArcFace's compactness objective, so a single
   `others` prototype is meaningless.
 
@@ -192,6 +191,9 @@ sh nptools/train_posm.sh \
   941.8 → 1820.0 img/s and the split shrinks 1705 MB → 879 MB, built in ~8 s.
   Originals are never modified, `imbaldup_*` symlinks from step 6 are relinked (not duplicated), and
   `nobg_*.png` cutouts keep PNG + alpha. Re-runs are mtime-checked, so only changed images are rewritten.
+- **`--deg-threshold D`** (default 28) sets the open-set reject angle and is forwarded to
+  `openset.py` in the generated export script, so the run directory records the threshold its
+  artifacts were built with. See step 8 and [`openset.md`](openset.md) §2.2.
 - **`--img-size N`** (default 224) is the single size knob: it is passed straight to
   `train.py --img-size`, it fixes the pre-resize target at `2N`, and it fills in the sizes in the
   export commands printed at the end of the run. Keep it consistent across training and export.
@@ -226,14 +228,12 @@ per class, resolves a **single constant reject threshold** shared by every class
 deployable model.
 
 ```bash
-# optional first: inspect the false-reject / false-accept tradeoff without writing anything --
-# calibration always runs, so simply omit the --export-* flags
 uv run python nptools/openset.py \
     --data-dir <DATA> --class-map <DATA>/class_84.txt \
     --ck <DATA>/output/<run>/model_best.pth.tar
 
-# export both formats in ONE run (shared prototype pass, and both artifacts then carry the
-# same prototypes and the same calibrated threshold -- a second run would recalibrate)
+# export both formats in ONE run: they then share the prototype pass and carry identical
+# prototypes (the threshold is a fixed angle, so that part is reproducible either way)
 uv run python nptools/openset.py \
     --data-dir <DATA> \
     --class-map <DATA>/class_84.txt \
@@ -270,15 +270,17 @@ What happens:
 - **One constant threshold** is applied to every class. Per-class thresholds were removed after
   measurement: they overfit 3.8× worse on held-out data, and the old quantile values were tight
   enough to falsely reject ~13–15% of real product images.
-- **The threshold is always calibrated** during the run, sharing the feature pass with prototype
-  building — it cannot be pinned, so it can never go stale against the checkpoint. Negatives come
-  from leave-one-class-out on your own labelled data, so no curated negative set is required. It is
-  seeded, so the same checkpoint always exports the same artifact. A floor applies
-  (`--min-threshold`, default 0.2); a suggestion below it is clamped up and warns, since that
-  indicates a data problem rather than a genuinely tiny threshold.
+- **The threshold is a fixed angle**, `--deg-threshold` (default **28°**), converted to the cosine
+    distance the graph compares (`1 − cos(28°) = 0.1171`). It is not derived from the data, so it
+    cannot go stale and every export is reproducible. Calibration was retired because its negatives
+    were other *trained* classes, which ArcFace drives 83–87° apart — easy negatives that produced a
+    far too permissive value (~63°). Measured: real class members sit within ~13°, so **20–30° is the
+    band**; lower rejects more unknowns, higher accepts more. `train_posm.sh --deg-threshold` sets
+    it for the export script it generates. Full measurement in
+    [`openset.md`](openset.md) §2.2.
 - Export writes `openset.pt` (or `.onnx`) **plus** `openset.pt.meta.json` (class order, the scalar
-  threshold, img_size, mean/std, resize filter, and the measured FRR/FAR that justified the
-  value). After export it **self-verifies** by predicting through the exported model.
+  threshold, `threshold_deg`, img_size, mean/std, resize filter and channel order). After export it
+  **self-verifies** by predicting through the exported model.
 - **`--eval-csv` scores the training crops per class, twice**, and writes
   `(class type, recall rate, precision rate, eval type)`:
   - `all` — every crop;
@@ -291,10 +293,11 @@ What happens:
   prototypes, so recall sits near 100% by construction, and the useful signal is *which* classes
   move between the two rounds — those are the ones carrying mislabelled crops (cross-check them in
   `outlier/outlier.txt`, §2.1 of [`openset.md`](openset.md)). Note also that `OUTLIER_THR` is a
-  hardcoded 0.5: when the calibrated threshold lands near it, "outlier" and "would be rejected"
-  nearly coincide and the `inliers` round is close to tautological.
+  hardcoded 0.5 (≈60°), well outside the 20–30° band, so "outlier" and "would be rejected at
+  inference" are now distinct tests -- the outlier cutoff is a data-cleaning tool, not a shadow of
+  the decision rule.
 
-Why one threshold rather than per-class, how calibration works, the client's preprocessing contract,
+Why one threshold rather than per-class, how the angle was chosen, the client's preprocessing contract,
 and ncnn conversion are all in [`openset.md`](openset.md).
 
 ---
@@ -323,7 +326,7 @@ uv run pnnx <DATA>/output/<run>/openset.pt inputshape=[1,3,224,224]
 - Verified on a `--no-argmin` export: the resulting `.param` is 76 layers of `Convolution`,
   `ConvolutionDepthWise`, `BinaryOp`, `Split`, `Pooling`, `Reshape`, `Flatten`, **one** `Normalize`
   and **one** `InnerProduct` — zero `ArgMin`/`ArgMax`/`Gather`/`Crop`. ncnn output matches
-  TorchScript to ~4e-3 on `dists` (fp32 kernel differences, three orders below the 0.46 threshold),
+  TorchScript to ~4e-3 on `dists` (fp32 kernel differences, far below the 0.1171 threshold),
   with identical decisions on every image tested.
 - The TorchScript route (`.pt`) usually yields a leaner ncnn graph than the ONNX route; both give the
   same model. Useful pnnx args: `fp16=1` (default), `optlevel=2`.

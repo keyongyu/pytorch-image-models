@@ -42,7 +42,18 @@ AMP=1
 # + pnnx -> ncnn). The script is always written either way; this only decides whether it is also
 # executed. Costs a couple of minutes (the prototype pass and threshold calibration dominate), and
 # a training run whose artifacts were never exported is the more common annoyance. --no-ncnn skips.
+# Open-set reject threshold, as the ANGLE between a query feature and its nearest class prototype
+# (openset.py converts it to the cosine distance 1-cos, which is what the graph compares). Fixed
+# rather than calibrated: calibration measured against other TRAINED classes, which ArcFace drives
+# 83-87 degrees apart, so its plateau midpoint (~63 deg) admitted far too much. Measured on posmlvx,
+# real class members sit within 13.3 deg (p99), so 20-30 is the sensible band -- lower rejects more
+# unknowns, higher accepts more. Passed to openset.py in the generated export script.
+DEG_THRESHOLD=28
 NCNN=1
+# Detector half of the deployed npnn container: the generated export script concatenates this
+# and the exported open-set model into one two-section file (nptools/make_npnn.py). Unset it,
+# or point BOX_MODEL at another detector, to skip or change that step.
+BOX_MODEL="${BOX_MODEL:-nptools/pbfiles/NPBox_20260816.pb}"
 # The pre-resize is unconditional: shrinking 10 MP JPEGs on every epoch cost 10.5ms of the 14.3ms
 # per-sample budget -- more than the whole augmentation -- and npaug's PIL draft() cannot help the
 # elongated shelf crops that dominate this dataset (JPEG DCT scaling is uniform, so it only reduces
@@ -60,6 +71,7 @@ NCNN=1
  #   --output-dir PATH  output/checkpoints  (default: $DATA_DIR/output)
  #   --class-map PATH   class-map file      (default: $DATA_DIR/class_84.txt)
  #   --img-size  N      model input size    (default: 224; split always pre-resized to 2*N)
+ #   --deg-threshold D  open-set reject angle in degrees (default: 28)
  #   --no-arcface       disable --arcface        (on by default)
  #   --no-per-class-acc disable --per-class-acc  (on by default)
  #   --no-amp           disable --amp            (on by default)
@@ -81,6 +93,11 @@ Options:
                      pre-resized once into <data-dir>/train_<2N> and trained from there, because npaug
                      normalises every sample to a 2*img_size canvas -- 2N is exactly the detail
                      the pipeline can use. Originals are never modified.
+  --deg-threshold D  Open-set reject threshold as an ANGLE in degrees between a query feature
+                     and its nearest class prototype. (default: ${DEG_THRESHOLD}) Passed to
+                     openset.py in the export script. Real class members measure within ~13 deg,
+                     so 20-30 is the sensible band: lower rejects more unknowns, higher accepts
+                     more.
   --test-npaug-dir PATH  DRY-RUN: no training; dump augmented images (grouped by class)
                      to PATH for <=4 epochs to visually test nptools/npaug.py.
   --test-npaug-class CLS  Restrict that dry-run to class folder(s) only (comma-separated).
@@ -128,6 +145,8 @@ EOF
          # derives the pre-resize target (2x) and the export hint's sizes from it.
          --img-size)     IMG_SIZE="$2"; shift ;;
          --img-size=*)   IMG_SIZE="${1#*=}" ;;
+         --deg-threshold)   DEG_THRESHOLD="$2"; shift ;;
+         --deg-threshold=*) DEG_THRESHOLD="${1#*=}" ;;
          --test-npaug-dir)     TEST_NPAUG_DIR="$2"; shift ;;
          --test-npaug-dir=*)   TEST_NPAUG_DIR="${1#*=}" ;;
          --test-npaug-class)   TEST_NPAUG_CLASS="$2"; shift ;;
@@ -438,6 +457,7 @@ cat <<EOF
 #   openset.pt / openset.onnx     the exported model (+ .meta.json preprocessing contract)
 #   openset.ncnn.param / .bin     what you ship; pnnx writes them next to the .pt
 #   eval_rounds.csv               per-class recall/precision, all crops vs inliers only
+#   NPBox_openset.npnn            detector + open-set in one container, for the device
 set -e
 cd "$(pwd)"
 
@@ -446,6 +466,8 @@ DATA_DIR="${OPENSET_DATA_DIR}"
 CLASS_MAP="${CLASS_MAP}"
 IMG_SIZE=${IMG_SIZE}
 OUT_DIR="${RUN_DIR}"
+BOX_MODEL="${BOX_MODEL}"
+DEG_THRESHOLD=${DEG_THRESHOLD}
 EOF
 cat <<'EOF'
 
@@ -474,6 +496,7 @@ uv run python nptools/openset.py \
     --class-map "${CLASS_MAP}" \
     --checkpoint "${CKPT}" \
     --img-size "${IMG_SIZE}" \
+    --deg-threshold "${DEG_THRESHOLD}" \
     --eval-csv "${OUT_DIR}/eval_rounds.csv" \
     --export-pt "${OUT_DIR}/openset.pt" \
     --export-onnx "${OUT_DIR}/openset.onnx" \
@@ -487,9 +510,26 @@ command -v pnnx >/dev/null 2>&1 || uv run pnnx --help >/dev/null 2>&1 || uv pip 
 # failing. Outputs land next to the .pt, alongside .pnnx.* intermediates that are safe to delete.
 uv run pnnx "${OUT_DIR}/openset.pt" "inputshape=[1,3,${IMG_SIZE},${IMG_SIZE}]"
 
+# Pack detector + classifier into the single npnn container the device loads: the detector's
+# header verbatim with its Content: marker flipped to "Content: OpenSet", its weights, then an
+# "model: OpenSet" section carrying SkuNum/InputWidth/InputHeight from openset.pt.meta.json and the
+# open-set param+bin. Skipped (not an error) when no detector is available -- the ncnn files above
+# are still complete on their own.
+if [ -n "${BOX_MODEL}" ] && [ -f "${BOX_MODEL}" ]; then
+    uv run python -m nptools.make_npnn \
+        --box "${BOX_MODEL}" \
+        --param "${OUT_DIR}/openset.ncnn.param" \
+        --bin "${OUT_DIR}/openset.ncnn.bin" \
+        --meta "${OUT_DIR}/openset.pt.meta.json" \
+        --out "${OUT_DIR}/NPBox_openset.npnn"
+elif [ -n "${BOX_MODEL}" ]; then
+    echo "note: detector ${BOX_MODEL} not found -- skipping the combined .npnn"
+fi
+
 echo
 echo "ncnn files:"
 ls -1 "${OUT_DIR}"/openset.ncnn.* 2>/dev/null || echo "  (none -- check the pnnx output above)"
+[ -f "${OUT_DIR}/NPBox_openset.npnn" ] && echo "combined npnn (detector + open-set):        ${OUT_DIR}/NPBox_openset.npnn"
 echo "class order + threshold + preprocessing: ${OUT_DIR}/openset.pt.meta.json"
 echo "per-class recall/precision (2 rounds):      ${OUT_DIR}/eval_rounds.csv"
 EOF

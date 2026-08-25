@@ -17,7 +17,7 @@ How it works here (feature-prototype / metric approach):
 ```
       ┌──────────── build once, from training data (classes from class-map) ─────┐
       │  for each class: mean of its pre-logits features → prototype (L2-norm)   │
-      │  ONE constant reject threshold, always calibrated (floor 0.2)            │
+      │  ONE constant reject threshold: a fixed angle (--deg-threshold, 28°)     │
       └──────────────────────────────────────────────────────────────────────────┘
 
   image ─► backbone ─► pre-logits feature (1280-d) ─► L2 normalize
@@ -71,11 +71,7 @@ class-map defines which classes to use, in what order, and — via its line coun
 | `--checkpoint PATH` / `--ck` | **yes** (PyTorch/export path) | the trained checkpoint to load (`--ck` is a short alias) |
 | `--data-dir DIR` | no (default posmlv) | dataset root with `train/`, `val/`, `test/` subfolders |
 | `--img-size N` | no (default 224) | square input size. **Must match what was trained** — this default is independent of `train_posm.sh`, and a mismatch does not error: the size is baked into the exported graph and recorded in the sidecar, so prototypes get extracted at one scale while the client feeds another and accuracy quietly drops. `train_posm.sh` fills this in for you in the export command it prints. |
-| `--min-threshold M` | no (default 0.2) | floor on the calibrated threshold. A suggestion below it is clamped up and warned about, since a tiny threshold rejects genuine products (0.02 costs ~10% false-reject on posmlv) while barely reducing false-accepts. |
-| `--aug` / `--no-aug` | no (default `--aug`) | during calibration, probe with **npaug-augmented** views so the in-distribution spread reflects real variation instead of near-duplicate video frames (prototypes stay clean); `--no-aug` probes the clean crops with leave-one-image-out instead |
-| `--aug-views N` | no (default 3) | augmented probe views per image during calibration |
-| `--aug-max-per-class N` | no (default 200) | cap on probe images per class during calibration; `0` = use all |
-| `--cpu-aug` | no (default off) | use CPU npaug (albumentations) instead of GPU torchvision for the aug probe — faithful to training augmentation, much slower |
+| `--deg-threshold DEG` | no (default **28**) | reject anything farther than DEG **degrees** from its nearest prototype; the graph gets `1 − cos(DEG)` (28° → 0.1171). Fixed, not calibrated — see §2.2 for the measurement behind the default and why 20–30 is the band. `train_posm.sh` forwards its own `--deg-threshold` here. |
 | `--eval-csv [PATH]` | no | score the **training crops** per class twice -- over everything (`all`) and again with the outlier crops dropped (`inliers`) -- writing `(class type, recall rate, precision rate, eval type)` to PATH (default `<checkpoint dir>/eval_rounds.csv`). Same prototypes and threshold in both rounds, so the delta is what those crops cost, per class. Reuses the export's feature pass (~0.2s). **Fit, not generalization**: the scored crops are the ones that built the prototypes, so recall sits near 100% by construction and the signal is *which* classes move between the rounds. |
 | `--copy-inliers` | no (default off) | while building prototypes, also copy the **good inlier** crops (cosine dist ≤ 0.5 to their class prototype) into `<data-dir>/inlier/<class>/` — a cleaned training set (see §2.1) |
 | `--gpu-predict` | no (default **CPU**) | run **prediction/verification** on GPU (ONNX `CUDAExecutionProvider`, TorchScript + in-memory model on `cuda`). Default is CPU so verification mirrors the ncnn deployment target. **Prototype building always uses the GPU** regardless of this flag; it only affects the predict/verify pass. |
@@ -87,7 +83,6 @@ class-map defines which classes to use, in what order, and — via its line coun
 
 ```bash
 # Classify val/ + test/ images with the PyTorch prototypes (no export).
-# Still calibrates first — that happens on every run that builds prototypes.
 uv run python nptools/openset.py \
     --data-dir posmlv --class-map posmlv/class_84.txt --checkpoint <run>/model_best.pth.tar
 
@@ -118,18 +113,16 @@ Notes:
   zero weight row makes the dot product identically zero regardless of kernel path.
   Dropping such classes instead (as this used to do) shifted every index after the first gap, which
   a client cannot recover from — it has only the class-map file to index with.
-- **The threshold is one constant, and it is always calibrated.** There is no way to pin a value:
-  a hand-set threshold goes stale silently the moment the checkpoint or the class set changes, and
-  nothing in the artifact would reveal it. The clean feature pass is shared between calibration and
-  prototype building, so this costs one extra augmented pass rather than two full ones. The chosen
-  value and its measured FRR/FAR land in the sidecar `meta.json`.
-- **A floor applies** (`--min-threshold`, default 0.2). Small thresholds reject genuine products —
-  measured on posmlv, 0.02 costs 10% false-reject and 0.007 costs 50%, while false-accept stays
-  under 0.2% across that range. A suggestion below the floor is clamped up and warns loudly: it
-  means the positives and negatives are not well separated (mislabelled crops, or near-duplicate
-  classes), which is a data problem rather than a threshold to honour.
-- **Calibration is seeded** (`torch.manual_seed`, plus python/numpy in the DataLoader workers), so
-  export is reproducible: the same checkpoint produces the same artifact every run.
+- **The threshold is one constant, shared by every class, and it is a fixed angle** —
+  `--deg-threshold` (default 28°), recorded in `meta.json` as both `threshold` (the cosine distance
+  the graph uses) and `threshold_deg`. It is not derived from the data; §2.2 has the measurement
+  that motivates the default and the reason the old calibration was retired.
+- **Very small angles reject genuine products.** Real class members sit within ~13° (p99), so
+  anything under ~20° starts clipping them: 15° doubles the false-reject rate and 13° quintuples it
+  (§2.2). If a *large* angle seems necessary to accept your own products, the crops are the problem,
+  not the threshold — check `outlier/outlier.txt` (§2.1).
+- **Export is reproducible**: nothing about the threshold is sampled or data-derived, so the same
+  checkpoint and class-map produce the same artifact every run.
 - Prototype building is **parallelized** (DataLoader workers + batched GPU inference) and prints
   its **elapsed time**.
 - **Prediction source:** with `--image` it's that one image; otherwise it scans **only** the `val/`
@@ -157,10 +150,10 @@ Notes:
   PyTorch prototypes.
 - Both exports write **`<path>.meta.json`**:
   ```json
-  {"class_names": [...], "threshold": 0.46, "img_size": 224,
-   "mean": [0.5,0.5,0.5], "std": [0.5,0.5,0.5], "resize": "area", "no_argmin": true,
-   "threshold_source": "calibrated", "threshold_frr": 0.0011, "threshold_far": 0.0007,
-   "threshold_plateau": [0.166, 0.7637], "threshold_floor": 0.2,
+  {"class_names": [...], "threshold": 0.1171, "img_size": 224,
+   "mean": [0.5,0.5,0.5], "std": [0.5,0.5,0.5], "resize": "area", "channel_order": "bgr",
+   "no_argmin": true,
+   "threshold_source": "fixed-angle", "threshold_deg": 28.0,
    "empty_classes": ["posm_14", "posm_44"]}
   ```
   `class_names` is the **full class-map order**, one entry per exported column; `empty_classes` (only
@@ -168,9 +161,13 @@ Notes:
   prototype that always scores `dist = 1.0` and therefore never matches — report those as "no data"
   rather than as a product.
   `threshold` is a **scalar** (it used to be a per-class list — see the breaking-change note in §5);
-  `resize` names the downscale filter the client should use; `no_argmin` records which output format
-  was baked in. The `threshold_*` provenance fields are always present, since every export
-  calibrates.
+  `resize` names the downscale filter the client should use; **`channel_order` is `bgr`** — training
+  and prototype building both feed cv2's native order, so the client must NOT convert to RGB;
+  `no_argmin` records which output format
+  was baked in. `threshold` is the cosine distance the graph compares against and `threshold_deg`
+  the angle it came from (`threshold = 1 − cos(threshold_deg)`), with `threshold_source:
+  "fixed-angle"` recording that it was chosen, not measured — older artifacts say `"calibrated"`
+  and carry `threshold_frr`/`threshold_far`/`threshold_plateau`/`threshold_floor` instead.
 
 ---
 
@@ -277,75 +274,67 @@ Notes:
 - Inlier/outlier membership uses the **clean** prototype distance (the same gate used for the robust
   mean) — it reflects "close to its own class on clean preprocessing," independent of the
   reject threshold.
-  Outliers are excluded from calibration probes too, not just from the prototype: they are
-  mislabelled crops, so scoring them would charge the threshold for a false reject *and* a false
-  accept when the model is behaving correctly.
+  They are also the `all` vs `inliers` difference in the two-round evaluation (`--eval-csv`), which
+  is how you see per class what those crops are costing.
 - This is a **bootstrap loop**: train a first classifier → run `--copy-inliers` to clean the data →
   retrain on `inlier/` for a stronger model → optionally repeat.
 
 ---
 
-## 2.2 Choosing the threshold — always measured, never passed
+## 2.2 The threshold — a fixed angle, not a calibration
 
-The threshold is one number, so it is measured rather than guessed, and there is no flag to pin or
-to skip it: every run that builds prototypes sweeps candidates, prints what each one costs, and
-bakes the chosen value into the export. To read the curve **without writing artifacts, just omit
-`--export-pt`/`--export-onnx`**:
+The reject threshold is a **fixed angle** between the query feature and its nearest class prototype,
+`--deg-threshold` (default **28°**), converted to the cosine distance the graph compares against:
+`1 − cos(28°) = 0.1171`.
 
-```bash
-uv run python nptools/openset.py \
-    --data-dir posmlv --class-map posmlv/class_84.txt \
-    --ck <run>/model_best.pth.tar
-```
+**Why not calibrated.** Earlier versions swept candidate thresholds and reported measured
+false-reject / false-accept rates. The sweep was retired because its *negatives* were built by
+**leave-one-class-out** — masking a class's prototype and scoring its images against the other
+**trained** classes. ArcFace drives those 83–87° apart, so they are easy negatives: both error rates
+stayed flat across a huge span, the "safe plateau" ran from ~0.18 to ~0.72, and taking its midpoint
+produced ≈0.44 (**63°**). That answers *"can I tell my known classes apart?"* — obviously yes, they
+are near-orthogonal — not *"is this a product I know?"*. The number looked authoritative (it came
+with FRR/FAR to four decimals) while describing the wrong question.
 
-**No curated negative set is needed** — which matters, because a folder of assorted non-target
-images is rarely trustworthy enough to calibrate against. Both error rates come from your own
-labelled `train/` data, via two leave-one-out estimators computed from a single feature pass:
+**What the geometry actually looks like** (posmlvx, 12,855 crops / 71 classes, `tf_efficientnet_lite0`
+at 128px):
 
-- **False accept** (an un-enrolled product wrongly accepted) — *leave-one-CLASS-out*. For class `c`,
-  mask out its own prototype and score its images against the rest; by construction `c` is now a
-  product that was never enrolled. Since each prototype is built only from its own class's images,
-  dropping `c` leaves the others untouched, so this is a column mask, not a rebuild.
-- **False reject** (a known product wrongly rejected) — the probe must not sit inside the prototype
-  it is scored against. With `--aug` the probe is an augmented view, which was never part of the
-  clean prototype, so the plain distance is already unbiased. With `--no-aug` the probe *is* one of
-  the prototype's own images, so a *leave-one-IMAGE-out* mean `normalize(Σf − f_j)` removes it first.
+| | distance | angle |
+|---|---|---|
+| known crop → its own prototype, p50 | 0.0035 | **4.8°** |
+| known crop → its own prototype, p99 | 0.0270 | **13.3°** |
+| **28° threshold** | 0.1171 | 28.0° |
+| `others/` (unknown-ish) median | 0.5052 | 60.3° |
+| closest prototype pair | 0.8835 | 83.3° |
 
-Sorting the distances once turns every candidate threshold into a `searchsorted`, so the sweep is
-effectively free after the feature pass.
+Real class members live inside ~13°; everything from there to ~83° is empty. The threshold's job is
+to sit in that gap, and any value in it accepts every genuine product — so the choice is entirely
+about how much of the gap you concede to unknowns:
 
-```
-     thr    FRR (known rejected)   FAR (unenrolled accepted)
-  0.0069                  50.00%                       0.00%
-  0.0205                  10.00%                       0.00%
-  0.0523                   2.00%                       0.02%
-  0.1171                   0.50%                       0.04%
-  0.4065                   0.11%                       0.07%
-  0.8450                   0.05%                       0.50%
-  0.8836                   0.05%                       5.01%
-  0.9147                   0.05%                      25.01%
+| angle | distance | false-reject (knowns) | accepted from `others/` |
+|---|---|---|---|
+| 15° | 0.0341 | 0.568% | 2.19% |
+| 20° | 0.0603 | 0.272% | 5.12% |
+| **28° (default)** | **0.1171** | **0.210%** | **11.06%** |
+| 30° | 0.1340 | 0.202% | 12.62% |
+| 45° | 0.2929 | 0.187% | 28.62% |
+| *0.44 (old calibrated)* | 0.4400 | 0.171% | 43.06% |
 
-safe plateau: [0.1660 .. 0.7637] — anywhere in here performs within 0.2pp
-suggested   : 0.4600  (FRR=0.11%, FAR=0.07%)   [floor 0.2]
-```
+**20–30° is the sensible band.** Below 20° the false-reject curve turns sharply (15° doubles it)
+because you start clipping real class members. Above 30° you are only buying back fractions of the
+0.171% floor — which is not threshold-related at all: it is ~22 outlier crops sitting ~88° from
+their own prototype, a data problem no threshold fixes (see §2.1).
 
-Reading it: the two distributions are far apart, so a wide band of thresholds performs identically.
-The tool reports that **plateau** and suggests its midpoint — the value that tolerates the most
-drift in either direction before falling off an edge. An equal-error point would be arbitrary here,
-since both curves are flat across the gap.
+Two caveats on that table. The `others/` column is an **upper bound on false accepts**, not a
+measurement: those folders are not verified to exclude known products, and their p1 is 0.0214 —
+some of those images sit *inside* known clusters. And every number is measured on training crops, so
+the false-reject column is optimistic for unseen photos of known products.
 
-Three caveats it prints with the table:
-
-- LOCO negatives are other posm standees — same domain, same photographic style — so they sit closer
-  to the prototypes than a random shelf photo would. **FAR is a pessimistic bound.**
-- With no `val/`/`test/` split, every number is train-domain.
-- The midpoint weights false-reject and false-accept equally, and there is no flag to bias it.
-
-Every export runs this same sweep automatically and bakes the suggestion in, recording the
-provenance in `meta.json`. Omitting the `--export-*` flags stops before writing anything, so you
-can read the curve without producing an artifact.
-`--min-threshold` can only raise the floor (more permissive); there is currently no way to bias the
-choice toward a stricter value.
+**The trade-off this makes.** A fixed value cannot go stale against the checkpoint, and it is
+identical across runs, so exports are comparable. The risk inverts: it can be *wrong* if a future
+model has looser clusters (no ArcFace, far fewer epochs, many more classes). `build_prototypes`
+prints each class's mean and max distance-to-prototype, so a model whose spread approaches the
+threshold shows up in the export log rather than failing quietly.
 
 ---
 
@@ -360,7 +349,7 @@ image.
 
 | name | shape | dtype | notes |
 |---|---|---|---|
-| `image` | `[1, 3, 224, 224]` | float32 | RGB, **squash**-resized to 224×224, normalized `mean=std=0.5` |
+| `image` | `[1, 3, 224, 224]` | float32 | **BGR** (cv2's native order — no `cvtColor`), **squash**-resized to 224×224, normalized `mean=std=0.5` |
 
 **Output** — depends on `--no-argmin`:
 
@@ -470,8 +459,9 @@ bgr = cv2.imread('x.jpg', cv2.IMREAD_COLOR)
 # Prefer INTER_AREA: it is the correct filter for shrinking and matches how the prototypes
 # were built. cv2's default is INTER_LINEAR, which does not anti-alias -- see the note below.
 bgr = cv2.resize(bgr, (224, 224), interpolation=cv2.INTER_AREA)      # squash (not letterbox)
-rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
-mat = ncnn.Mat.from_pixels(rgb, ncnn.Mat.PixelType.PIXEL_RGB, 224, 224)
+# No cvtColor: the model is TRAINED on BGR, so cv2's native order goes straight in. Converting
+# to RGB here is the classic silent bug -- it does not fail, it just returns worse distances.
+mat = ncnn.Mat.from_pixels(bgr, ncnn.Mat.PixelType.PIXEL_BGR, 224, 224)
 # mean=std=0.5 on 0..1  ==  (x/255 - 0.5)/0.5  ==  x/127.5 - 1  on 0..255 pixels:
 mat.substract_mean_normalize([127.5, 127.5, 127.5], [1/127.5, 1/127.5, 1/127.5])
 
@@ -501,7 +491,7 @@ filter gives the *same* threshold, and shipping PIL-built prototypes to a client
 costs nothing detectable:
 
 ```
-                    calibrated thr    FRR     FAR      (client vs PIL-built prototypes, at 0.47)
+                    threshold then    FRR     FAR      (client vs PIL-built prototypes, at 0.47)
 PIL bicubic              0.47        0.01%   0.02%
 cv2 INTER_AREA           0.47        0.02%   0.02%
 cv2 INTER_LINEAR         0.47        0.02%   0.01%
@@ -541,8 +531,9 @@ PIL-bicubic ↔ cv2 INTER_CUBIC    median 0.00027   p95 0.00270   max 0.053
 
 Client rules:
 1. **Preprocess identically** to export — squash-resize to 224×224 (because training used
-   `--crop-mode=squash`) with **`INTER_AREA`**, RGB, `substract_mean_normalize([127.5]*3,
-   [1/127.5]*3)`. This is the #1 source of "correct in PyTorch, wrong in ncnn."
+   `--crop-mode=squash`) with **`INTER_AREA`**, **BGR** (i.e. `cv2.imread` output unchanged), and
+   `substract_mean_normalize([127.5]*3, [1/127.5]*3)`. This is the #1 source of "correct in PyTorch,
+   wrong in ncnn". `meta['channel_order']` states the order, so assert on it rather than assuming.
 2. **Decision:** `best = argmin(dists)`; `margins[best] > 0` (equivalently `dists[best] >
    meta['threshold']`) ⇒ **reject as unknown**; otherwise the product is `class_names[best]`. The
    threshold is already baked into `margins`, so the client just checks the sign at the nearest class.
@@ -608,14 +599,8 @@ unless your app framework must have the model emit the final decision.
 ## TL;DR (recommended: `--no-argmin`, runs on stock ncnn)
 
 ```bash
-# 0. (optional) see what each threshold costs, on your own data, no negatives needed:
-#    same command as below minus the --export-* flags, so nothing is written
-uv run python nptools/openset.py \
-    --data-dir posmlv --class-map posmlv/class_84.txt \
-    --ck <run>/model_best.pth.tar
-
 # 1. build open-set model from checkpoint + training data (classes from class-map), export it
-#    the threshold is always calibrated automatically -- there is nothing to pass
+#    reject threshold defaults to 28 degrees; --deg-threshold N to change it
 uv run python nptools/openset.py \
     --data-dir posmlv --class-map posmlv/class_84.txt \
     --checkpoint <run>/model_best.pth.tar \
@@ -624,7 +609,7 @@ uv run python nptools/openset.py \
 # 2. convert to ncnn
 uv run pnnx nptools/openset.pt inputshape=[1,3,224,224]                       # → openset.ncnn.*
 
-# 3. client: preprocess (squash 224 + mean/std 0.5) → run → best=argmin(dists) →
+# 3. client: preprocess (BGR, squash 224 INTER_AREA, mean/std 0.5) → run → best=argmin(dists) →
 #    margins[best]>0 ⇒ unknown ; else class_names[best]  (names/threshold in openset.pt.meta.json)
 ```
 

@@ -587,9 +587,19 @@ def _composite_rgba(fg_rgba, bg_rgb):
 
 
 def _finalize_tensor(np_rgb, mean, std, normalize, use_prefetcher, dump_subdir=None):
-    """HWC uint8 RGB -> CHW tensor; normalized float unless prefetcher / normalize=False (uint8)."""
-    _maybe_dump(np_rgb, dump_subdir)  # optional debug dump of the post-augmentation image
-    t = torch.from_numpy(np.ascontiguousarray(np_rgb)).permute(2, 0, 1).contiguous()
+    """HWC uint8 RGB -> CHW **BGR** tensor; normalized float unless prefetcher/normalize=False.
+
+    The channel swap happens here, at the single point where every train and eval sample becomes a
+    tensor, and deliberately AFTER the augmentation: albumentations' colour ops (HueSaturationValue,
+    CLAHE, RandomToneCurve) are documented against RGB, so they keep seeing RGB.
+
+    Why BGR at all: the deployed ncnn client decodes with cv2.imread, which yields BGR. Training in
+    BGR removes the cvtColor from the client's hot path and, more importantly, removes the chance of
+    it being forgotten -- a swapped-channel client does not fail, it just returns quietly worse
+    distances. nptools/openset.py builds prototypes in BGR to match; the two MUST agree.
+    """
+    _maybe_dump(np_rgb, dump_subdir)  # dump before the swap: PIL writes RGB
+    t = torch.from_numpy(np.ascontiguousarray(np_rgb[:, :, ::-1])).permute(2, 0, 1).contiguous()
     if use_prefetcher or not normalize:
         return t  # uint8; prefetcher scales & normalizes on device
     t = t.float().div_(255.0)

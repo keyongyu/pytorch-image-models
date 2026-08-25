@@ -1,0 +1,22 @@
+Version: MBV2_1/FORMAT3
+StepScale: 0.019 0.038 0.076 0.152 0.304
+AspectRatio: 1.2 2.2 3.0
+SkuNum: 1
+InferNetType: NCNN
+AspectRatioThresholdMin: 0.333
+AspectRatioThresholdMax: 2.0
+OverlapRatio: 0.0
+InputWidth: 864
+InputHeight: 1152
+Net: mobilenet8x8
+TrainDate: 2023-04-19:17:29:49 (optional)
+CompressDirection: WIDTH (optional)
+Squash: Y (optional) Notes:squashed to input width and height, not by the original image aspect ratio
+Content: OpenSet
+...weight of ssd
+Model: OpenSet
+SkuNum: 80
+InputWidth: 128
+InputHeight: 128
+Content:
+...weight of openset
