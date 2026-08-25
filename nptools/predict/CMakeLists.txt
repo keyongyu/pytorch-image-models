@@ -5,15 +5,13 @@
 #   ./build/predict_ncnn <run>/openset.ncnn.param <run>/openset.ncnn.bin \
 #                        ../../posmlvx/class_84.txt photo.jpg 128
 #
-# ncnn is fetched and built as a subproject, pinned to tag NCNN_TAG below, so the build does not
-# depend on a system install -- ncnn is not packaged for Ubuntu, and the pip `ncnn` wheel ships only
-# the Python extension module (no headers, no CMake config), so it cannot satisfy a C++ build.
-# The first configure clones and compiles ncnn (a few minutes); after that it is cached in the build
-# directory. Set -DFETCHCONTENT_SOURCE_DIR_NCNN=/path/to/ncnn to build against a local checkout
-# instead of cloning.
+# ncnn is fetched and built as a subproject, pinned to NCNN_TAG below, so no ncnn install is
+# needed: it is not packaged for Ubuntu, and the pip `ncnn` wheel ships only the Python extension
+# module (no headers, no CMake config) so it cannot satisfy a C++ build. First configure clones and
+# compiles it (~35s at -j20, then cached in the build dir). Build against a local checkout instead
+# with -DFETCHCONTENT_SOURCE_DIR_NCNN=/path/to/ncnn.
 #
-# OpenCV must be installed (headers + libs): `sudo apt install libopencv-dev`, or point CMake at a
-# local prefix with -DCMAKE_PREFIX_PATH=/opt/opencv.
+# OpenCV 4 must be installed: `sudo apt install libopencv-dev`, or -DCMAKE_PREFIX_PATH=/opt/opencv.
 
 cmake_minimum_required(VERSION 3.16)
 project(openset_predict_ncnn LANGUAGES CXX)
@@ -24,14 +22,12 @@ if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
     set(CMAKE_BUILD_TYPE Release CACHE STRING "" FORCE)
 endif()
 
-set(NCNN_TAG "20260526" CACHE STRING "ncnn release tag to fetch and build")
-
 # --- ncnn (fetched) -------------------------------------------------------------------------------
-# Everything but the library itself is turned off: tools/examples/benchmarks/tests roughly triple
-# the build, and this client needs none of them. Vulkan is off too -- the head is a normalize, a
-# matmul and two subtractions, so a GPU upload costs more than it saves, and it keeps the glslang
-# submodule out of the picture (hence GIT_SUBMODULES ""). Static lib: one binary, nothing to install
-# or set LD_LIBRARY_PATH for.
+# Everything but the library is off: tools/examples/benchmarks/tests roughly triple the build and
+# this client needs none of them. Vulkan off too -- the head is a normalize, a matmul and two
+# subtractions, so a GPU upload costs more than it saves, and it keeps glslang out of the picture
+# (hence GIT_SUBMODULES ""). Static lib: one self-contained binary, no LD_LIBRARY_PATH.
+set(NCNN_TAG "20260526" CACHE STRING "ncnn release tag to fetch and build")
 set(NCNN_BUILD_TOOLS      OFF CACHE BOOL "" FORCE)
 set(NCNN_BUILD_EXAMPLES   OFF CACHE BOOL "" FORCE)
 set(NCNN_BUILD_BENCHMARK  OFF CACHE BOOL "" FORCE)
@@ -52,21 +48,19 @@ FetchContent_Declare(
 )
 FetchContent_MakeAvailable(ncnn)
 
-# --- OpenCV ---------------------------------------------------------------------------------------
+# --- OpenCV 4 -------------------------------------------------------------------------------------
 # Only imgcodecs (decode) and imgproc (the INTER_AREA resize the preprocessing contract requires)
-# are used; naming them keeps a static link from pulling in highgui/videoio. OpenCV 5 is what the
-# Python side pins (opencv-python-headless>=5.0.0.93), but 4.x works -- nothing here touches an API
-# that changed between them.
-find_package(OpenCV 5 QUIET COMPONENTS imgcodecs imgproc)
-if(NOT OpenCV_FOUND)
-    find_package(OpenCV REQUIRED COMPONENTS imgcodecs imgproc)
-    message(STATUS "OpenCV 5 not found; building against ${OpenCV_VERSION}")
-endif()
+# are used -- naming them keeps a static link from dragging in highgui/videoio, which this client
+# never touches. OpenCV 4 is what the distro ships (`sudo apt install libopencv-dev` -> 4.6 on
+# noble); the Python side pins opencv-python-headless>=5 separately, and the two do not need to
+# match because nothing here touches an API that changed between 4 and 5 -- verified by the C++ and
+# Python clients returning identical distances.
+find_package(OpenCV 4 REQUIRED COMPONENTS imgcodecs imgproc)
 
 # --- OpenMP ---------------------------------------------------------------------------------------
-# ncnn parallelises its layers with OpenMP. Linked explicitly because a static ncnn does not
-# propagate it, and the link then fails on undefined omp_* symbols. Optional: without it ncnn still
-# runs correctly, single-threaded.
+# ncnn parallelises its layers with OpenMP. An installed ncnn usually propagates this through its
+# imported target, but link it explicitly so a build against a static ncnn does not fail at the
+# link step with undefined omp_* symbols. Optional: single-threaded still runs correctly.
 find_package(OpenMP)
 
 add_executable(predict_ncnn predict_ncnn.cpp)
