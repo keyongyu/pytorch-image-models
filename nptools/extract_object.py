@@ -23,7 +23,7 @@ Pipeline detail:
 
 GPU is used automatically once the pip NVIDIA libs are on LD_LIBRARY_PATH (handled below).
 
-Run (rembg lives in the venv but not the project lockfile):
+Run:
     uv run python nptools/extract_object.py --video-folder posmlv/posm_18videos --dest-dir posmlv/objects
 """
 import os

@@ -36,34 +36,67 @@ dependencies = [
         'safetensors',
         "datasets>=3.1.0",
         "pyarrow>=17.0.0",
+
+        # --- nptools/ tooling: augmentation, background removal, ONNX/NCNN export ---
+        # These live in the MAIN dependency list on purpose. They used to sit in an optional
+        # `nptools` extra, but `uv sync` prunes anything outside the default set, so a plain
+        # `uv run` silently uninstalled rembg/ncnn/the CUDA wheels and broke the venv.
+        # Markers because requires-python is >=3.8 while these packages drop 3.9.
         "opencv-python-headless>=5.0.0.93",
-        "albumentations",
-        "onnx",
-        "onnxruntime-gpu"
-        
+        "albumentations>=2.0 ; python_version >= '3.10'",
+        "rembg>=2.0.69 ; python_version >= '3.10'",
+        "onnx>=1.16",
+        "ncnn ; python_version >= '3.10'",
+
+        # GPU ONNX runtime. rembg does NOT pull onnxruntime itself (it moved that to its own
+        # [cpu]/[gpu] extras), so installing the base package alongside onnxruntime-gpu gives
+        # rembg a GPU runtime with no CPU/GPU clash.
+        "onnxruntime>=1.17,<1.20 ; python_version >= '3.10'",
+        "onnxruntime-gpu>=1.17,<1.20 ; python_version >= '3.10'",
+        # onnxruntime-gpu declares none of its CUDA runtime deps, so they must be named here or
+        # it silently falls back to CPU. nptools/extract_object.py:_ensure_cuda_libs() puts these
+        # on LD_LIBRARY_PATH at import time.
+        "nvidia-cudnn-cu12 ; python_version >= '3.10'",
+        "nvidia-cublas-cu12 ; python_version >= '3.10'",
+        "nvidia-cufft-cu12 ; python_version >= '3.10'",
+        "nvidia-curand-cu12 ; python_version >= '3.10'",
+        "nvidia-cuda-runtime-cu12 ; python_version >= '3.10'",
+        "nvidia-cuda-nvrtc-cu12 ; python_version >= '3.10'",
 ]
 dynamic = ["version"]
 
-[project.optional-dependencies]
-# Extra libraries used by the experimentation scripts in nptools/ and by timm/data/npaug.py
-# (data augmentation, background removal, ONNX/NCNN export). NOT needed for core timm — npaug
-# imports albumentations/cv2 lazily. Require Python >= 3.10 (modern rembg/albumentations/
-# onnxruntime drop 3.9), hence the markers.
-#
-# NOTE: a clean `uv lock`/`uv sync --extra nptools` can conflict — rembg pulls CPU `onnxruntime`
-# while we want `onnxruntime-gpu`, and onnxruntime-gpu additionally needs matching CUDA 12 + cuDNN 9
-# libs (installed separately as nvidia-*-cu12 wheels). The tested install path is direct:
-#   uv pip install "albumentations>=2.0" opencv-python-headless "rembg>=2.0.69" \
-#                  "onnxruntime-gpu>=1.17,<1.20" "onnx>=1.16" ncnn \
-#                  nvidia-cudnn-cu12 nvidia-cublas-cu12 nvidia-cufft-cu12 nvidia-curand-cu12 \
-#                  nvidia-cuda-runtime-cu12 nvidia-cuda-nvrtc-cu12
-nptools = [
-    "albumentations>=2.0 ; python_version >= '3.10'",
-    "opencv-python-headless>=4.10 ; python_version >= '3.10'",
-    "rembg>=2.0.69 ; python_version >= '3.10'",
-    "onnxruntime-gpu>=1.17,<1.20 ; python_version >= '3.10'",
-    "onnx>=1.16 ; python_version >= '3.10'",
-    "ncnn ; python_version >= '3.10'",
+[tool.uv]
+# Belt and braces: nothing currently requires the CPU `onnxruntime`, but if a future dependency
+# pulls it back it would shadow onnxruntime-gpu (both provide the same `onnxruntime` module) and
+# quietly drop inference to CPU. This makes that requirement unsatisfiable instead of silent.
+# Same story for opencv: `ncnn` depends on opencv-python (full), which ships the same `cv2`
+# module as the opencv-python-headless we depend on directly. Two distributions owning one import
+# name means whichever was installed last wins. Headless is what belongs on a training box.
+override-dependencies = [
+    "opencv-python ; sys_platform == 'never'",
+]
+
+# Resolve the lock only for the environment this project is actually developed on. `requires-python`
+# stays >=3.8 for the published package, but a *universal* lock across 3.8-3.13 drags transitive
+# deps down to their oldest common version -- rembg -> pymatting -> numba resolved to 0.53.1
+# (2021, pre-3.10) instead of 0.67. This key is uv-only and does not affect package metadata.
+environments = ["sys_platform == 'linux' and python_version >= '3.10'"]
+
+# rembg -> pymatting -> numba. Left alone, the universal resolution picks pymatting 1.1.14 and
+# numba 0.53.1, whose newest wheels are cp39 -- on this 3.10 venv that means building a 2021 numba
+# from source, which fails. A modern chain exists (pymatting 1.1.15 / numba 0.67), so require it.
+constraint-dependencies = ["numba>=0.59", "pymatting>=1.1.15"]
+
+[dependency-groups]
+# uv reads PEP 735 [dependency-groups]; it does NOT read [tool.pdm.dev-dependencies] below, so
+# without this a plain `uv sync` uninstalls pytest and friends and `pytest tests/` stops working.
+# Kept in step with [tool.pdm.dev-dependencies].
+dev = [
+    "pytest",
+    "pytest-timeout",
+    "pytest-xdist",
+    "pytest-forked",
+    "expecttest",
 ]
 
 [project.urls]

@@ -457,6 +457,7 @@ cat <<EOF
 #   openset.pt / openset.onnx     the exported model (+ .meta.json preprocessing contract)
 #   openset.ncnn.param / .bin     what you ship; pnnx writes them next to the .pt
 #   eval_rounds.csv               per-class recall/precision, all crops vs inliers only
+#   outlier/                      the crops THIS checkpoint rejected from its own class, + outlier.txt
 #   NPBox_openset.npnn            detector + open-set in one container, for the device
 set -e
 cd "$(pwd)"
@@ -491,6 +492,14 @@ cat <<'EOF'
 # outlier crops dropped -- into (class type, recall rate, precision rate, eval type). Same
 # prototypes and threshold both rounds, so the delta is exactly what those crops cost. Free: it
 # reuses the feature pass the export already ran.
+#
+# Stamp the start time first: openset.py writes <data-dir>/outlier/outlier.txt only when this run
+# actually flagged something, and never deletes an older one, so the file's age is the only way to
+# tell "this checkpoint flagged nothing" from "a previous checkpoint's list is still lying there".
+OUTLIER_STAMP="${OUT_DIR}/.outlier_stamp"
+mkdir -p "${OUT_DIR}"
+touch "${OUTLIER_STAMP}"
+
 uv run python nptools/openset.py \
     --data-dir "${DATA_DIR}" \
     --class-map "${CLASS_MAP}" \
@@ -501,6 +510,36 @@ uv run python nptools/openset.py \
     --export-pt "${OUT_DIR}/openset.pt" \
     --export-onnx "${OUT_DIR}/openset.onnx" \
     --no-argmin
+
+# Mirror THIS run's outlier crops into the run dir, next to the checkpoint that flagged them.
+# openset.py writes them under <data-dir>/outlier/<class>/ so they can be eyeballed beside the
+# dataset, but that location says nothing about which model produced it -- and the crops a
+# checkpoint refuses to accept into its own class are a training artifact, so they belong with
+# eval_rounds.csv and the .meta.json.
+#
+# Copied by MANIFEST, not with `cp -r`: outlier.txt is rewritten each run, but the image folders are
+# only ever added to (shutil.copy2 into an exist_ok dir), so <data-dir>/outlier accumulates the
+# UNION over every checkpoint ever exported. Copying it wholesale would attribute another model's
+# rejects to this one.
+OUTLIER_SRC="${DATA_DIR}/outlier"
+OUTLIER_DST="${OUT_DIR}/outlier"
+rm -rf "${OUTLIER_DST}"              # inside the run dir, and rebuilt below -- re-running is idempotent
+if [ -f "${OUTLIER_SRC}/outlier.txt" ] && [ "${OUTLIER_SRC}/outlier.txt" -nt "${OUTLIER_STAMP}" ]; then
+    mkdir -p "${OUTLIER_DST}"
+    cp -p "${OUTLIER_SRC}/outlier.txt" "${OUTLIER_DST}/outlier.txt"
+    # Field 1 of each data row is "<class>/<file>", space-padded by openset.py's aligned CSV writer;
+    # `read -r` with a single variable strips that padding but keeps any spaces inside the name.
+    tail -n +2 "${OUTLIER_SRC}/outlier.txt" | cut -d, -f1 | while read -r rel; do
+        case "$rel" in ''|*/*) ;; *) continue ;; esac      # expect <class>/<file>
+        [ -n "$rel" ] && [ -f "${OUTLIER_SRC}/${rel}" ] || continue
+        mkdir -p "${OUTLIER_DST}/${rel%/*}"
+        cp -p "${OUTLIER_SRC}/${rel}" "${OUTLIER_DST}/${rel}"
+    done
+    echo "outlier crops flagged by this checkpoint: $(find "${OUTLIER_DST}" -type f ! -name outlier.txt | wc -l) -> ${OUTLIER_DST}"
+else
+    echo "no outlier crops flagged by this checkpoint"
+fi
+rm -f "${OUTLIER_STAMP}"
 
 # pnnx is not a project dependency; install on demand rather than failing three minutes in.
 command -v pnnx >/dev/null 2>&1 || uv run pnnx --help >/dev/null 2>&1 || uv pip install pnnx ncnn
@@ -532,6 +571,11 @@ ls -1 "${OUT_DIR}"/openset.ncnn.* 2>/dev/null || echo "  (none -- check the pnnx
 [ -f "${OUT_DIR}/NPBox_openset.npnn" ] && echo "combined npnn (detector + open-set):        ${OUT_DIR}/NPBox_openset.npnn"
 echo "class order + threshold + preprocessing: ${OUT_DIR}/openset.pt.meta.json"
 echo "per-class recall/precision (2 rounds):      ${OUT_DIR}/eval_rounds.csv"
+# `if`, not `[ ... ] && echo`: this is the script's LAST command, so a false test would make the
+# whole export exit non-zero and train_posm.sh would report a failure that did not happen.
+if [ -d "${OUT_DIR}/outlier" ]; then
+    echo "outlier crops this checkpoint rejected:     ${OUT_DIR}/outlier"
+fi
 EOF
 } > "${EXPORT_SH}"
 chmod +x "${EXPORT_SH}"
